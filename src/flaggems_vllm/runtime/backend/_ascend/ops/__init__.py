@@ -18,12 +18,14 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
 
 __all__ = [
     "fused_experts_impl",
+    "grouped_topk",
     "inplace_fused_experts",
     "outplace_fused_experts",
     "scaled_int8_quant",
