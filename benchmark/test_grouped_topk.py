@@ -75,15 +75,65 @@ def torch_grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def rocm_aiter_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    num_tokens = scores.size(0)
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=scores.device)
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
+    if bias is not None:
+        rocm_aiter_ops.biased_grouped_topk(
+            scores.float(),
+            bias.float(),
+            topk_weights,
+            topk_ids,
+            num_expert_group,
+            topk_group,
+            renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+    else:
+        is_softmax = scoring_func == 0
+        rocm_aiter_ops.grouped_topk(
+            scores.float(),
+            topk_weights,
+            topk_ids,
+            num_expert_group,
+            topk_group,
+            renormalize,
+            scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+    return topk_weights, topk_ids
+
+
 vendor_name = flaggems_vllm.vendor_name
+USE_AITER = False
 
 try:
-    import vllm._custom_ops as ops  # noqa: F401
-
-    if hasattr(torch.ops._moe_C, "grouped_topk"):
-        ref_grouped_topk = torch.ops._moe_C.grouped_topk
+    if vendor_name == "hygon":
+        from vllm._aiter_ops import is_aiter_found_and_supported
+        if is_aiter_found_and_supported():
+            ref_grouped_topk = rocm_aiter_grouped_topk
+            USE_AITER = True
+        else:
+            ref_grouped_topk = torch_grouped_topk
     else:
-        ref_grouped_topk = torch_grouped_topk
+        import vllm._custom_ops  # noqa: F401
+
+        if hasattr(torch.ops._moe_C, "grouped_topk"):
+            ref_grouped_topk = torch.ops._moe_C.grouped_topk
+        else:
+            ref_grouped_topk = torch_grouped_topk
 except (ImportError, AttributeError):
     ref_grouped_topk = torch_grouped_topk
 
@@ -138,6 +188,7 @@ class GroupedTopKBenchmark(base.Benchmark):
 
 
 @pytest.mark.grouped_topk
+@pytest.mark.skipif(USE_AITER, reason="scoring_func == 0 is not supported when bias is present for aiter")
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
@@ -155,6 +206,7 @@ def test_grouped_topk_no_renorm():
 
 
 @pytest.mark.grouped_topk
+@pytest.mark.skipif(USE_AITER, reason="scoring_func == 0 is not supported when bias is present for aiter")
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working ")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")

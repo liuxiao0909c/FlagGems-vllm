@@ -152,13 +152,64 @@ def torch_grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-try:
-    import vllm._custom_ops as ops  # noqa: F401
+def rocm_aiter_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    from vllm._aiter_ops import rocm_aiter_ops
 
-    if hasattr(torch.ops._moe_C, "grouped_topk"):
-        ref_grouped_topk = torch.ops._moe_C.grouped_topk
+    num_tokens = scores.size(0)
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=scores.device)
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
+    if bias is not None:
+        assert scoring_func == 1
+        rocm_aiter_ops.biased_grouped_topk(
+            scores.float(),
+            bias.float(),
+            topk_weights,
+            topk_ids,
+            num_expert_group,
+            topk_group,
+            renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+        )
     else:
-        ref_grouped_topk = torch_grouped_topk
+        is_softmax = scoring_func == 0
+        rocm_aiter_ops.grouped_topk(
+            scores.float(),
+            topk_weights,
+            topk_ids,
+            num_expert_group,
+            topk_group,
+            renormalize,
+            scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+    return topk_weights, topk_ids
+
+
+USER_AITER = False
+
+try:
+    if vendor_name == "hygon":
+        from vllm._aiter_ops import is_aiter_found_and_supported
+        if is_aiter_found_and_supported():
+            ref_grouped_topk = rocm_aiter_grouped_topk
+            USE_AITER = True
+        else:
+            ref_grouped_topk = torch_grouped_topk
+    else:
+        import vllm._custom_ops  # noqa: F401
+        if hasattr(torch.ops._moe_C, "grouped_topk"):
+            ref_grouped_topk = torch.ops._moe_C.grouped_topk
+        else:
+            ref_grouped_topk = torch_grouped_topk
 except (ImportError, AttributeError):
     ref_grouped_topk = torch_grouped_topk
 
@@ -188,6 +239,9 @@ def test_grouped_topk_deepseek_v3_2(
     scoring_func,
 ):
     """Test grouped_topk accuracy with configs from DeepSeek-v3.2"""
+    if USE_AITER and scoring_func == 0:
+        pytest.skip("scoring_func == 0 is not supported when bias is present for aiter")
+
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
@@ -254,6 +308,8 @@ def test_grouped_topk(
     dtype,
 ):
     """Test grouped_topk accuracy against vLLM CUDA implementation"""
+    if USE_AITER and scoring_func == 0:
+        pytest.skip("scoring_func == 0 is not supported when bias is present for aiter")
 
     if n_expert % n_group != 0:
         return
@@ -319,6 +375,9 @@ def test_grouped_topk_large_scale(
     dtype,
 ):
     """Test grouped_topk with larger scale configurations"""
+    if USE_AITER and scoring_func == 0:
+        pytest.skip("scoring_func == 0 is not supported when bias is present for aiter")
+
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
 
@@ -364,6 +423,8 @@ def test_grouped_topk_large_scale(
 @pytest.mark.parametrize("renormalize", [True, False])
 def test_grouped_topk_scaling_factor(routed_scaling_factor, renormalize):
     """Test grouped_topk with different scaling factors"""
+    if USE_AITER:
+        pytest.skip("scoring_func == 0 is not supported when bias is present for aiter")
 
     torch.manual_seed(45)
     torch.cuda.manual_seed(45)
@@ -402,6 +463,8 @@ def test_grouped_topk_scaling_factor(routed_scaling_factor, renormalize):
 @pytest.mark.parametrize("scoring_func", [0, 1])
 def test_grouped_topk_single_token(renormalize, scoring_func):
     """Test grouped_topk with single token"""
+    if USE_AITER and scoring_func == 0:
+        pytest.skip("scoring_func == 0 is not supported when bias is present for aiter")
 
     torch.manual_seed(45)
     torch.cuda.manual_seed(45)
