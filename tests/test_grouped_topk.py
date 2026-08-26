@@ -163,46 +163,21 @@ def hcu_grouped_topk(
     scoring_func: int = 0,
 ):
     from aiter import moe_fused_gate
-    from aiter import biased_grouped_topk
-    from aiter import biased_grouped_topk_hip
 
     num_tokens = scores.size(0)
     topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=scores.device)
     topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
-    #moe_fused_gate(
-    #    scores.float(),
-    #    bias.float(),
-    #    topk_weights,
-    #    topk_ids,
-    #    num_expert_group,
-    #    topk_group,
-    #    topk,
-    #    0,  # n_share_experts_fusion
-    #    routed_scaling_factor,
-    #)
-
-    biased_grouped_topk(
+    moe_fused_gate(
         scores.float(),
         bias.float(),
         topk_weights,
         topk_ids,
         num_expert_group,
         topk_group,
-        0,  # n_share_experts_fusion
-        renormalize,
-        routed_scaling_factor,
+        topk=topk,
+        n_share_experts_fusion=0,
+        routed_scaling_factor=routed_scaling_factor,
     )
-    #biased_grouped_topk_hip(
-    #    scores.float(),
-    #    bias.float(),
-    #    topk_weights,
-    #    topk_ids,
-    #    num_expert_group,
-    #    topk_group,
-    #    renormalize,
-    #    1.0,
-    #)
-    #return topk_weights, topk_ids
 
 
 USE_AITER = False
@@ -224,8 +199,8 @@ except (ImportError, AttributeError):
 
 def hcu_case_check(renormalize: bool, scoring_func: int):
     # Refer to the implementation of the moe_fused_gate_impl in aiter:
-    # 1. perform sigmoid operation
-    # 3. divide weight by the sum of all weights
+    # 1. always perform sigmoid operation
+    # 3. always divide weight by the sum of all weights
     if USE_AITER and not (renormalize and scoring_func == 1):
         pytest.skip("not supported by moe_fused_gate in aiter")
 
