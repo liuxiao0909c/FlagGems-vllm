@@ -85,34 +85,25 @@ def rocm_aiter_grouped_topk(
     bias: torch.Tensor,
     scoring_func: int = 0,
 ):
-    from vllm._aiter_ops import rocm_aiter_ops
+    from aiter import moe_fused_gate
+    from aiter import biased_grouped_topk
 
     num_tokens = scores.size(0)
     topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=scores.device)
     topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
-    if bias is not None:
-        rocm_aiter_ops.biased_grouped_topk(
-            scores.float(),
-            bias.float(),
-            topk_weights,
-            topk_ids,
-            num_expert_group,
-            topk_group,
-            renormalize,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-    else:
-        is_softmax = scoring_func == 0
-        rocm_aiter_ops.grouped_topk(
-            scores.float(),
-            topk_weights,
-            topk_ids,
-            num_expert_group,
-            topk_group,
-            renormalize,
-            scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+    #moe_fused_gate(
+    biased_grouped_topk(
+        scores.float(),
+        bias.float(),
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        #topk,
+        0,  # n_share_experts_fusion
+        renormalize,
+        routed_scaling_factor,
+    )
     return topk_weights, topk_ids
 
 
