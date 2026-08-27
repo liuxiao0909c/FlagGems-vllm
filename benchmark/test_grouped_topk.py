@@ -259,7 +259,8 @@ def test_grouped_topk_score_1():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
         torch_op=ref_grouped_topk,
-        dtypes=[torch.bfloat16],
+        #dtypes=[torch.bfloat16],
+        dtypes=[torch.float32],
         renormalize=True,
         scoring_func=1,
     )
