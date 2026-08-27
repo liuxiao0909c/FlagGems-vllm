@@ -318,33 +318,34 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     NUM_GROUPS_PAD: tl.constexpr,
     TOPK_PAD: tl.constexpr,
     FULL_SHAPE: tl.constexpr,
+    ROW_PER_CTA: tl.constexpr,
 ):
     WARP_SIZE: tl.constexpr = 32
     NUM_WARPS: tl.constexpr = NUM_GROUPS_PAD
     neg_inf: tl.constexpr = float("-inf")
     MAX_IDX: tl.constexpr = 65535
 
-    token_id = tl.program_id(0) * 8
-    row_len = min(8, num_tokens - token_id)
+    token_id = tl.program_id(0) * ROW_PER_CTA
+    row_len = min(ROW_PER_CTA, num_tokens - token_id)
     scores_ptr += token_id * scores_stride0
     topk_values_ptr += token_id * topk
     topk_indices_ptr += token_id * topk
     #dump_ptr += token_id * scores_stride0
-    rows = tl.arange(0, 8)
+    rows = tl.arange(0, ROW_PER_CTA)
     warps = tl.arange(0, NUM_WARPS)
     lane = tl.arange(0, WARP_SIZE)
     topk_offs = tl.arange(0, TOPK_PAD)
 
     if HAS_TLE:
         s_score_sigmoid = tle.gpu.alloc(
-            [8, NUM_WARPS, WARP_SIZE],
+            [ROW_PER_CTA, NUM_WARPS, WARP_SIZE],
             dtype=tl.float32,
             layout=None,
             scope=tle.gpu.smem,
             nv_mma_shared_layout=False,
         )
         s_score_bias = tle.gpu.alloc(
-            [8, NUM_WARPS, WARP_SIZE],
+            [ROW_PER_CTA, NUM_WARPS, WARP_SIZE],
             dtype=tl.float32,
             layout=None,
             scope=tle.gpu.smem,
@@ -396,7 +397,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         )
 
     # step2: get top2 as group_score
-    min_val0 = tl.full((8, NUM_WARPS, WARP_SIZE), neg_inf, dtype=tl.float32)
+    min_val0 = tl.full((ROW_PER_CTA, NUM_WARPS, WARP_SIZE), neg_inf, dtype=tl.float32)
     comp_val_idx0 = _pack_val_idx_fp32(score_bias, offs)
     packed_max00 = tl.max(comp_val_idx0, axis=-1)
     val_max0, _0 = _unpack_val_idx_fp32(packed_max00)
@@ -413,9 +414,9 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     #return
 
     # step3: get topk_group, topk_group <= MAX_NUM_TOP_GROUPS, where MAX_NUM_TOP_GROUPS = 4
-    min_val1 = tl.full((8, NUM_WARPS,), neg_inf, dtype=tl.float32)
+    min_val1 = tl.full((ROW_PER_CTA, NUM_WARPS,), neg_inf, dtype=tl.float32)
     comp_val_idx1 = _pack_val_idx_fp32(group_score, warps)
-    packed_max10 = tl.max(comp_val_idx1, axis=-1)  # [8]
+    packed_max10 = tl.max(comp_val_idx1, axis=-1)  # [ROW_PER_CTA]
     _2, group_idx0 = _unpack_val_idx_fp32(packed_max10)
     comp_val_idx1 = tl.where(
         comp_val_idx1 == packed_max10[:, None],
@@ -530,9 +531,9 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     #tl.store(dump_ptr + rows[:, None] * scores_stride0 + lane[None, :] + 32 * 6, expert_score_group22)
     #tl.store(dump_ptr + rows[:, None] * scores_stride0 + lane[None, :] + 32 * 7, expert_score_group33)
 
-    min_val2 = tl.full((8, WARP_SIZE,), neg_inf, dtype=tl.float32)
-    top_experts = tl.full((8, TOPK_PAD,), MAX_IDX, dtype=tl.uint32)
-    packed_max20 = tl.full((8,), 0, dtype=tl.uint64)
+    min_val2 = tl.full((ROW_PER_CTA, WARP_SIZE,), neg_inf, dtype=tl.float32)
+    top_experts = tl.full((ROW_PER_CTA, TOPK_PAD,), MAX_IDX, dtype=tl.uint32)
+    packed_max20 = tl.full((ROW_PER_CTA,), 0, dtype=tl.uint64)
     for kk in tl.static_range(0, topk):
         update = (kk > 0) & (comp_val_idx20 == packed_max20[:, None])
         comp_val_idx20 = tl.where(
@@ -555,7 +556,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
             _pack_val_idx_fp32(min_val2, expert_idx_group3),
             comp_val_idx23,
         )
-        packed_max20 = tl.max(comp_val_idx20, axis=-1)  # [8]
+        packed_max20 = tl.max(comp_val_idx20, axis=-1)  # [ROW_PER_CTA]
         _3, out_idx = _unpack_val_idx_fp32(packed_max20)
         #tl.store(dump_ptr + kk * 8 + rows, out_idx)
         top_experts = tl.where(topk_offs[None, :] == kk, out_idx[:, None], top_experts)
@@ -565,11 +566,11 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         s_score_sigmoid_ptr + rows[:, None] * NUM_WARPS * WARP_SIZE + top_experts,
         mask=(rows[:, None] < row_len) & (topk_offs[None, :] < topk),
         other=0.0
-    )  # [8, TOPK_PAD]
-    topk_sum = tl.full([8], 1e-20, dtype=tl.float32)
+    )  # [ROW_PER_CTA, TOPK_PAD]
+    topk_sum = tl.full([ROW_PER_CTA], 1e-20, dtype=tl.float32)
     if renormalize:
         topk_sum += tl.sum(lane_unbiased, axis=-1)
-    scale = tl.full([8], routed_scaling_factor.to(tl.float32), tl.float32)
+    scale = tl.full([ROW_PER_CTA], routed_scaling_factor.to(tl.float32), tl.float32)
     if renormalize:
         scale /= topk_sum
     out_offs = rows[:, None] * topk + topk_offs[None, :]
@@ -657,7 +658,8 @@ def grouped_topk(
         #dump_buf = torch.empty([8, num_tokens, num_experts], device=scores.device, dtype=torch.float32)
         n_group_pad = triton.next_power_of_2(n_group)
         topk_pad = triton.next_power_of_2(topk)
-        grid = (num_tokens + 8 - 1) // 8
+        ROW_PER_CTA = 8
+        grid = (num_tokens + ROW_PER_CTA - 1) // ROW_PER_CTA
         triton_grouped_topk_fused_small_expert_count_kernel[(grid,)](
             scores,
             topk_values,
@@ -679,7 +681,8 @@ def grouped_topk(
             HAS_TLE=HAS_TLE,
             NUM_GROUPS_PAD=n_group_pad,
             TOPK_PAD=topk_pad,
-            FULL_SHAPE=num_experts_per_group == 32 and n_group == n_group_pad and num_tokens % 8 == 0,
+            FULL_SHAPE=num_experts_per_group == 32 and n_group == n_group_pad and num_tokens % ROW_PER_CTA == 0,
+            ROW_PER_CTA=ROW_PER_CTA,
             num_warps=8,
         )
 
