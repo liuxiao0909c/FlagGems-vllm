@@ -16,12 +16,10 @@ import os
 
 import pytest
 import torch
-from packaging.version import InvalidVersion, Version
 
 from flaggems_vllm.ops import indexer_k_quant_and_cache
 
-_TARGET_VLLM_VERSION = Version("0.20.2")
-_NEXT_VLLM_VERSION = Version("0.21.0")
+from . import accuracy_utils as utils
 
 
 def _is_fp8e4nv_supported():
@@ -44,6 +42,13 @@ pytestmark = [
 
 
 def _default_fp8_dtype():
+    try:
+        from vllm.platforms import current_platform
+
+        return current_platform.fp8_dtype()
+    except ImportError:
+        pass
+
     if getattr(torch.version, "hip", None) is not None and hasattr(
         torch, "float8_e4m3fnuz"
     ):
@@ -57,28 +62,11 @@ def _is_fp8_fnuz(dtype):
     return hasattr(torch, "float8_e4m3fnuz") and dtype == torch.float8_e4m3fnuz
 
 
-def _check_target_vllm_version(vllm):
-    version = getattr(vllm, "__version__", "0.0.0")
-    try:
-        parsed = Version(version.split("+", 1)[0])
-        if parsed < _TARGET_VLLM_VERSION or parsed >= _NEXT_VLLM_VERSION:
-            return False
-    except InvalidVersion:
-        pass
-    return True
-
-
 def _load_vllm_cuda_op():
     os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
-    if getattr(torch.version, "cuda", None) is None:
-        return None, False
     try:
-        import vllm
         import vllm._custom_ops as ops
     except Exception:
-        return None, False
-
-    if not _check_target_vllm_version(vllm):
         return None, False
 
     if not hasattr(ops, "indexer_k_quant_and_cache"):
@@ -180,6 +168,8 @@ def _make_slot_mapping(num_tokens, num_blocks, block_size, device):
     [
         (torch.bfloat16, 19, 4, 16, 128, 128, "ue8m0"),
         (torch.float16, 23, 5, 16, 512, 128, "ue8m0"),
+        (torch.float16, 29, 6, 16, 384, 128, "ue8m0"),
+        (torch.float16, 31, 7, 16, 640, 128, "ue8m0"),
         (torch.bfloat16, 17, 4, 64, 512, 128, "ue8m0"),
     ],
 )
@@ -222,4 +212,4 @@ def test_indexer_k_quant_and_cache_matches_reference(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(gems_cache, reference_cache, rtol=0, atol=0)
+    utils.gems_assert_equal(gems_cache, utils.to_reference(reference_cache))
