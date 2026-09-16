@@ -16,8 +16,7 @@ import os
 
 import pytest
 import torch
-
-from flaggems_vllm.ops import indexer_k_quant_and_cache
+import flaggems_vllm
 
 from . import accuracy_utils as utils
 
@@ -30,14 +29,14 @@ def _is_fp8e4nv_supported():
 
 
 pytestmark = [
-    pytest.mark.skipif(
-        not torch.cuda.is_available(),
-        reason="CUDA device required",
-    ),
-    pytest.mark.skipif(
-        not _is_fp8e4nv_supported(),
-        reason="fp8e4nv requires device capability >= 8.9",
-    ),
+    #pytest.mark.skipif(
+    #    not torch.cuda.is_available(),
+    #    reason="CUDA device required",
+    #),
+    #pytest.mark.skipif(
+    #    not _is_fp8e4nv_supported(),
+    #    reason="fp8e4nv requires device capability >= 8.9",
+    #),
 ]
 
 
@@ -186,7 +185,7 @@ def test_indexer_k_quant_and_cache_matches_reference(
     vllm_op, has_vllm = _load_vllm_cuda_op()
 
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = flaggems_vllm.device
     k = torch.randn(num_tokens, head_dim, device=device, dtype=dtype)
     slot_mapping = _make_slot_mapping(num_tokens, num_blocks, block_size, device)
 
@@ -203,7 +202,7 @@ def test_indexer_k_quant_and_cache_matches_reference(
         vllm_op(k, reference_cache, slot_mapping, quant_block_size, scale_fmt)
     else:
         torch_indexer(k, reference_cache, slot_mapping, quant_block_size, scale_fmt)
-    indexer_k_quant_and_cache(
+    flaggems_vllm.indexer_k_quant_and_cache(
         k,
         gems_cache,
         slot_mapping,

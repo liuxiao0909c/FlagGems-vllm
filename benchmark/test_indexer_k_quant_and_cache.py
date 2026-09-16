@@ -16,8 +16,7 @@ import os
 
 import pytest
 import torch
-
-from flaggems_vllm.ops import indexer_k_quant_and_cache
+import flaggems_vllm
 
 from . import base
 
@@ -75,7 +74,7 @@ class IndexerKQuantAndCacheBenchmark(base.Benchmark):
             torch_op=vllm_op,
             dtypes=[torch.float16, torch.bfloat16],  # vLLM supports both K dtypes.
         )
-        self.set_gems(indexer_k_quant_and_cache)
+        self.set_gems(flaggems_vllm.indexer_k_quant_and_cache)
         self.shape_desc = (
             "num_tokens, num_blocks, block_size, head_dim, quant_block_size"
         )
@@ -157,11 +156,11 @@ class IndexerKQuantAndCacheBenchmark(base.Benchmark):
             yield k, kv_cache, slot_mapping, quant_block_size, {"scale_fmt": "ue8m0"}
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.skipif(
-    not is_fp8e4nv_supported(),
-    reason="fp8e4nv requires device capability >= 8.9",
-)
+#@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+#@pytest.mark.skipif(
+#    not is_fp8e4nv_supported(),
+#    reason="fp8e4nv requires device capability >= 8.9",
+#)
 @pytest.mark.indexer_k_quant_and_cache
 def test_indexer_k_quant_and_cache_benchmark():
     bench = IndexerKQuantAndCacheBenchmark(load_vllm_cuda_op())
