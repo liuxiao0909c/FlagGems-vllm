@@ -21,25 +21,6 @@ import flaggems_vllm
 from . import accuracy_utils as utils
 
 
-def _is_fp8e4nv_supported():
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return major + minor / 10 >= 8.9
-
-
-pytestmark = [
-    #pytest.mark.skipif(
-    #    not torch.cuda.is_available(),
-    #    reason="CUDA device required",
-    #),
-    #pytest.mark.skipif(
-    #    not _is_fp8e4nv_supported(),
-    #    reason="fp8e4nv requires device capability >= 8.9",
-    #),
-]
-
-
 def _default_fp8_dtype():
     try:
         from vllm.platforms import current_platform
@@ -62,17 +43,16 @@ def _is_fp8_fnuz(dtype):
 
 
 def _load_vllm_cuda_op():
-    os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
     try:
-        import vllm._custom_ops as ops
+        import vllm._custom_ops as ops  # noqa: F401
     except Exception:
         return None, False
 
-    if not hasattr(ops, "indexer_k_quant_and_cache"):
+    if not hasattr(torch.ops._C_cache_ops, "indexer_k_quant_and_cache"):
         return None, False
 
     def vllm_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
-        ops.indexer_k_quant_and_cache(
+        torch.ops._C_cache_ops.indexer_k_quant_and_cache(
             k,
             kv_cache,
             slot_mapping,
@@ -131,26 +111,11 @@ def torch_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
 
 def _make_cache(num_blocks, block_size, head_dim, quant_block_size, device):
     cache_stride = head_dim + head_dim * 4 // quant_block_size
-    #fp8_dtype = _default_fp8_dtype()
     k_cache = torch.empty(
         (num_blocks, block_size, cache_stride),
         dtype=torch.uint8,
         device=device,
     )
-    #num_quant_blocks = head_dim // quant_block_size
-    #flat_cache = k_cache.view(num_blocks, -1)
-    #values = flat_cache[:, : block_size * head_dim].view(fp8_dtype)
-    #values.copy_(torch.randn(values.shape, device=device).to(fp8_dtype))
-    #scales = flat_cache[:, block_size * head_dim :].view(torch.float32)
-    #scales.copy_(
-    #    torch.rand(
-    #        num_blocks,
-    #        block_size * num_quant_blocks,
-    #        device=device,
-    #        dtype=torch.float32,
-    #    )
-    #    + 0.01
-    #)
     return k_cache
 
 
