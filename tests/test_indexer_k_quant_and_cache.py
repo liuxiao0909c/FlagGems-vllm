@@ -131,26 +131,26 @@ def torch_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
 
 def _make_cache(num_blocks, block_size, head_dim, quant_block_size, device):
     cache_stride = head_dim + head_dim * 4 // quant_block_size
-    fp8_dtype = _default_fp8_dtype()
+    #fp8_dtype = _default_fp8_dtype()
     k_cache = torch.empty(
         (num_blocks, block_size, cache_stride),
         dtype=torch.uint8,
         device=device,
     )
-    num_quant_blocks = head_dim // quant_block_size
-    flat_cache = k_cache.view(num_blocks, -1)
-    values = flat_cache[:, : block_size * head_dim].view(fp8_dtype)
-    values.copy_(torch.randn(values.shape, device=device).to(fp8_dtype))
-    scales = flat_cache[:, block_size * head_dim :].view(torch.float32)
-    scales.copy_(
-        torch.rand(
-            num_blocks,
-            block_size * num_quant_blocks,
-            device=device,
-            dtype=torch.float32,
-        )
-        + 0.01
-    )
+    #num_quant_blocks = head_dim // quant_block_size
+    #flat_cache = k_cache.view(num_blocks, -1)
+    #values = flat_cache[:, : block_size * head_dim].view(fp8_dtype)
+    #values.copy_(torch.randn(values.shape, device=device).to(fp8_dtype))
+    #scales = flat_cache[:, block_size * head_dim :].view(torch.float32)
+    #scales.copy_(
+    #    torch.rand(
+    #        num_blocks,
+    #        block_size * num_quant_blocks,
+    #        device=device,
+    #        dtype=torch.float32,
+    #    )
+    #    + 0.01
+    #)
     return k_cache
 
 
