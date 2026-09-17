@@ -20,28 +20,9 @@ import triton
 import triton.language as tl
 
 
+# Token from FlagGems-vllm/src/flaggems_vllm/runtime/backend/_ascend/ops/per_token_group_quant_fp8.py
 @triton.jit
 def _f32_to_fp8_e4m3fn(y):
-    """Bit-exact f32 -> e4m3fn conversion (RNE); `y` must be finite and
-    pre-clamped to [-448, 448].
-
-    Ascend has no native fp8 conversion instruction and BiShengHIR cannot
-    lower ``.to(float8_e4m3fn)`` at all, so this branchless sequence needs
-    only a few integer ops per element:
-      * normals (|y| >= 2^-6): rebias the exponent (127 -> 7) and RNE-round
-        the mantissa from 23 to 3 bits via ``t += 0x7FFFF + lsb_of_result``;
-      * subnormals: ``k = RNE(|y| / 2**-9)`` with the magic-number add
-        ``|y| * 512 + 2**23`` (an f32 add rounds to-nearest-even, leaving k
-        in the low mantissa bits).
-
-    int32 stands in for uint32 because the Ascend compiler rejects
-    ``tl.where`` on uint32 (it would widen it to uint64 with rint mode).
-    The result is identical: ``a`` is always non-negative so signed
-    compares match unsigned ones, ``r_norm`` is only selected where ``t``
-    is positive (arithmetic shift == logical shift there), and the
-    ``& 1`` / ``& 0x80`` bit extractions read the same two's-complement
-    bits under either shift semantics.
-    """
     b = y.to(tl.int32, bitcast=True)
     a = b & 0x7FFFFFFF
     t = a - 0x3C000000
@@ -104,7 +85,7 @@ def _indexer_k_quant_and_cache_kernel(
 
     fp8_val = _f32_to_fp8_e4m3fn(val.to(tl.float32) / scale[:, None])
     dst_ptr = kv_cache_ptr + block_id * kv_cache_value_stride + block_offset * head_dim
-    tl.store(dst_ptr + offsets, fp8_val.to(tl.int8, bitcast=True), mask=mask)
+    tl.store(dst_ptr + offsets, fp8_val, mask=mask)
 
     dst_scale_ptr = (
         kv_cache_scale_ptr
@@ -132,9 +113,9 @@ def indexer_k_quant_and_cache(
     num_quant_blocks = head_dim // quant_block_size
 
     kv_cache_flat = kv_cache.view(num_blocks, -1)
-    # replace torch.float8_e4m3fn with torch.int8 to avoid the following error in `ast_to_ttir`:
+    # replace torch.float8_e4m3fn with torch.uint8 to avoid the following CompilationError:
     #     "type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')" 
-    kv_cache_value = kv_cache_flat[:, : block_size * head_dim].view(torch.int8)
+    kv_cache_value = kv_cache_flat[:, : block_size * head_dim].view(torch.uint8)
     kv_cache_scale = kv_cache_flat[:, block_size * head_dim :].view(torch.float32)
     num_tokens_pad = triton.next_power_of_2(num_tokens)
     _indexer_k_quant_and_cache_kernel[(num_tokens, triton.cdiv(num_quant_blocks, 4))](

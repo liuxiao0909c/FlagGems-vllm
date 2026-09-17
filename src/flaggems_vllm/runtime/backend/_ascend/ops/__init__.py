@@ -30,6 +30,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -50,6 +51,7 @@ __all__ = [
     "causal_conv1d_update",
     "fused_experts_impl",
     "grouped_topk",
+    "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "outplace_fused_experts",
     "qwen4_store_qsa_kv_rows",

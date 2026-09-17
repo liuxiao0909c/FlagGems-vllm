@@ -63,6 +63,65 @@ def _load_vllm_cuda_op():
     return vllm_indexer, True
 
 
+def _f32_to_fp8_e4m3fn(y):
+    """Bit-exact f32 -> e4m3fn conversion (RNE); `y` must be finite and
+    pre-clamped to [-448, 448].
+    """
+    b = y.view(torch.int32)
+    a = b & 0x7FFFFFFF
+    t = a - 0x3C000000
+    t += 0x0007FFFF + ((t >> 20) & 1)
+    r_norm = t >> 20
+    r_sub = (a.view(torch.float32) * 512.0 + 8388608.0).view(torch.int32) - 0x4B000000
+    r = torch.where(a >= 0x3C800000, r_norm, r_sub)
+    return (r | ((b >> 24) & 0x80)).to(torch.uint8)
+
+
+def torch_npu_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
+    num_blocks = kv_cache.shape[0]
+    block_size = kv_cache.shape[1]
+    head_dim = k.shape[-1]
+    num_quant_blocks = head_dim // quant_block_size
+    scale_divisor = 448.0
+
+    flat_cache = kv_cache.view(num_blocks, -1)
+    cache_values = flat_cache[:, : block_size * head_dim].view(torch.uint8)
+    cache_scales = flat_cache[:, block_size * head_dim :].view(torch.float32)
+
+    for token_idx in range(slot_mapping.numel()):
+        slot_id = int(slot_mapping[token_idx].item())
+        if slot_id < 0:
+            continue
+
+        block_id = slot_id // block_size
+        block_offset = slot_id % block_size
+        for quant_block_id in range(num_quant_blocks):
+            start = quant_block_id * quant_block_size
+            end = start + quant_block_size
+            val = k[token_idx, start:end]
+            amax = val.abs().to(torch.float32).amax()
+
+            scale = (
+                torch.maximum(
+                    amax,
+                    torch.tensor(1e-4, dtype=torch.float32, device=k.device),
+                )
+                / scale_divisor
+            )
+            if scale_fmt == "ue8m0":
+                scale = torch.exp2(torch.ceil(torch.log2(scale)))
+
+            value_start = block_offset * head_dim + start
+            value_end = value_start + quant_block_size
+            cache_values[block_id, value_start:value_end].copy_(
+                _f32_to_fp8_e4m3fn(val.to(torch.float32) / scale)
+            )
+            cache_scales[
+                block_id,
+                block_offset * num_quant_blocks + quant_block_id,
+            ] = scale
+
+
 def torch_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
     num_blocks = kv_cache.shape[0]
     block_size = kv_cache.shape[1]
@@ -163,8 +222,11 @@ def test_indexer_k_quant_and_cache_matches_reference(
     )
     reference_cache = gems_cache.clone()
 
+    #import pdb; pdb.set_trace()
     if has_vllm and dtype != torch.float16:
         vllm_op(k, reference_cache, slot_mapping, quant_block_size, scale_fmt)
+    elif flaggems_vllm.vendor_name == "ascend":
+        torch_npu_indexer(k, reference_cache, slot_mapping, quant_block_size, scale_fmt)
     else:
         torch_indexer(k, reference_cache, slot_mapping, quant_block_size, scale_fmt)
     flaggems_vllm.indexer_k_quant_and_cache(
@@ -174,6 +236,17 @@ def test_indexer_k_quant_and_cache_matches_reference(
         quant_block_size,
         scale_fmt,
     )
-    torch.cuda.synchronize()
+    if flaggems_vllm.vendor_name == "ascend":
+        torch.npu.synchronize()
+    else:
+        torch.cuda.synchronize()
 
+    #torch.save(reference_cache.cpu(), "tensor_file_ref.pt")
+    #torch.save(gems_cache.cpu(), "tensor_file_gems.pt")
+    #if num_tokens == 31:
+    #    a_ref = torch.load("tensor_file_ref.pt", map_location="cpu")
+    #    a_gems = torch.load("tensor_file_gems.pt", map_location="cpu")
+    #    utils.gems_assert_equal(a_ref, reference_cache.cpu())
+    #    utils.gems_assert_equal(a_gems, gems_cache.cpu())
+    #utils.gems_assert_equal(gems_cache.cpu(), utils.to_reference(reference_cache).cpu())
     utils.gems_assert_equal(gems_cache, utils.to_reference(reference_cache))

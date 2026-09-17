@@ -20,6 +20,7 @@ import flaggems_vllm
 
 from . import base
 
+USE_SOFT_CAST = flaggems_vllm.vendor_name == "ascend"
 
 def _default_fp8_dtype():
     try:
@@ -40,6 +41,20 @@ def _default_fp8_dtype():
 
 def _is_fp8_fnuz(dtype):
     return hasattr(torch, "float8_e4m3fnuz") and dtype == torch.float8_e4m3fnuz
+
+
+def _f32_to_fp8_e4m3fn(y):
+    """Bit-exact f32 -> e4m3fn conversion (RNE); `y` must be finite and
+    pre-clamped to [-448, 448].
+    """
+    b = y.view(torch.int32)
+    a = b & 0x7FFFFFFF
+    t = a - 0x3C000000
+    t += 0x0007FFFF + ((t >> 20) & 1)
+    r_norm = t >> 20
+    r_sub = (a.view(torch.float32) * 512.0 + 8388608.0).view(torch.int32) - 0x4B000000
+    r = torch.where(a >= 0x3C800000, r_norm, r_sub)
+    return (r | ((b >> 24) & 0x80)).to(torch.uint8).view(torch.float8_e4m3fn)
 
 
 def torch_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
@@ -79,9 +94,9 @@ def torch_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
 
             value_start = block_offset * head_dim + start
             value_end = value_start + quant_block_size
-            cache_values[block_id, value_start:value_end].copy_(
-                (val.to(torch.float32) / scale).to(fp8_dtype)
-            )
+            scaled_val = val.to(torch.float32) / scale
+            fp8_val = _f32_to_fp8_e4m3fn(scaled_val) if USE_SOFT_CAST else scaled_val.to(fp8_dtype)
+            cache_values[block_id, value_start:value_end].copy_(fp8_val)
             cache_scales[
                 block_id,
                 block_offset * num_quant_blocks + quant_block_id,
