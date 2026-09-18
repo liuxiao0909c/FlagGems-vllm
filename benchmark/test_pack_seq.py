@@ -32,10 +32,19 @@ except ImportError:
     HAS_VLLM = False
 
 
-if flaggems_vllm.vendor_name == "thead":
-    FP8_DTYPE = torch.float8_e5m2
-else:
+try:
+    val_fp32 = torch.zeros([1], dtype=torch.float32, device=flaggems_vllm.device)
+    val_fp8 = val_fp32.to(torch.float8_e4m3fn)
+    IS_FP8_SUPPORTED = True
     FP8_DTYPE = torch.float8_e4m3fn
+except Exception:
+    try:
+        val_fp8_2 = val_fp32.to(torch.float8_e5m2)
+        IS_FP8_SUPPORTED = True
+        FP8_DTYPE = torch.float8_e5m2
+    except Exception:
+        IS_FP8_SUPPORTED = False
+        FP8_DTYPE = None
 
 
 # =============================================================================
@@ -162,8 +171,8 @@ class PackSeqINT8Benchmark(base.Benchmark):
 
 @pytest.mark.pack_seq_triton
 @pytest.mark.skipif(
-    not HAS_VLLM,
-    reason="requires vLLM to be installed for reference comparison",
+    not (HAS_VLLM and IS_FP8_SUPPORTED),
+    reason="requires vLLM and FP8 support",
 )
 def test_pack_seq_fp8():
     bench = PackSeqFP8Benchmark(

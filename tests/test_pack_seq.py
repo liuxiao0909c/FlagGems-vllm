@@ -22,10 +22,19 @@ from . import accuracy_utils as utils
 from . import conftest as cfg
 
 
-if flaggems_vllm.vendor_name == "thead":
-    FP8 = torch.float8_e5m2
-else:
+try:
+    val_fp32 = torch.zeros([1], dtype=torch.float32, device=flaggems_vllm.device)
+    val_fp8 = val_fp32.to(torch.float8_e4m3fn)
+    IS_FP8_SUPPORTED = True
     FP8 = torch.float8_e4m3fn
+except Exception:
+    try:
+        val_fp8_2 = val_fp32.to(torch.float8_e5m2)
+        IS_FP8_SUPPORTED = True
+        FP8 = torch.float8_e5m2
+    except Exception:
+        IS_FP8_SUPPORTED = False
+        FP8 = None
 
 
 def _ref_pack_seq(x, lengths, pad_value=-float("inf")):
@@ -220,6 +229,7 @@ def test_pack_seq_block_sizes(block_t, block_d):
 
 
 @pytest.mark.pack_seq_triton
+@pytest.mark.skipif(not IS_FP8_SUPPORTED, reason="Requires FP8 support")
 @pytest.mark.parametrize(
     "N, H, D, lengths_list",
     [(6, 8, 4, [3, 3]), (10, 4, 8, [2, 4, 4]), (20, 16, 32, [5, 5, 5, 5])],
@@ -242,6 +252,7 @@ def test_pack_seq_fp8_basic(N, H, D, lengths_list):
 
 
 @pytest.mark.pack_seq_triton
+@pytest.mark.skipif(not IS_FP8_SUPPORTED, reason="Requires FP8 support")
 def test_pack_seq_fp8_custom_padding():
     N, H, D = 20, 8, 16
     lengths = torch.tensor([10, 10], dtype=torch.int32, device=flaggems_vllm.device)
@@ -259,6 +270,7 @@ def test_pack_seq_fp8_custom_padding():
 
 
 @pytest.mark.pack_seq_triton
+@pytest.mark.skipif(not IS_FP8_SUPPORTED, reason="Requires FP8 support")
 def test_pack_seq_fp8_default_inf_padding():
     N, H, D = 20, 8, 16
     lengths = torch.tensor([10, 10], dtype=torch.int32, device=flaggems_vllm.device)
@@ -270,6 +282,7 @@ def test_pack_seq_fp8_default_inf_padding():
 
 
 @pytest.mark.pack_seq_triton
+@pytest.mark.skipif(not IS_FP8_SUPPORTED, reason="Requires FP8 support")
 @pytest.mark.parametrize("block_t, block_d", [(32, 32), (64, 64), (128, 128)])
 def test_pack_seq_fp8_block_sizes(block_t, block_d):
     N, H, D = 100, 16, 32
