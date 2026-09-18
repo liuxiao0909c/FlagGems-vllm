@@ -29,16 +29,17 @@ def _fp8_check_kernel(x, y):
     val = tl.load(x)
     tl.store(y, val)
 
+
 try:
     FP8 = torch.float8_e4m3fn
-    x1 = torch.zeros([1], dtype=FP8, device=flaggems_vllm.device)
+    x1 = torch.randn(1, dtype=torch.float32, device=flaggems_vllm.device).to(FP8)
     y1 = torch.empty([1], dtype=FP8, device=flaggems_vllm.device)
     _fp8_check_kernel[(1,)](x1, y1)
     IS_FP8_SUPPORTED = True
 except Exception:
     try:
         FP8 = torch.float8_e5m2
-        x2 = torch.zeros([1], dtype=FP8, device=flaggems_vllm.device)
+        x2 = torch.randn(1, dtype=torch.float32, device=flaggems_vllm.device).to(FP8)
         y2 = torch.empty([1], dtype=FP8, device=flaggems_vllm.device)
         _fp8_check_kernel[(1,)](x2, y2)
         IS_FP8_SUPPORTED = True
