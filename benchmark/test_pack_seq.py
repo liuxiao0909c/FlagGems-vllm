@@ -48,7 +48,7 @@ try:
     IS_FP8_SUPPORTED = True
 except Exception:
     try:
-        FP8 = torch.float8_e5m2
+        FP8_DTYPE = torch.float8_e5m2
         x2 = torch.randn(1, dtype=torch.float32, device=flaggems_vllm.device).to(FP8_DTYPE)
         y2 = torch.empty([1], dtype=FP8_DTYPE, device=flaggems_vllm.device)
         _fp8_check_kernel[(1,)](x2, y2)
