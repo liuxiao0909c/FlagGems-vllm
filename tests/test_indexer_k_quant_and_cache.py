@@ -222,7 +222,6 @@ def test_indexer_k_quant_and_cache_matches_reference(
     )
     reference_cache = gems_cache.clone()
 
-    #import pdb; pdb.set_trace()
     if has_vllm and dtype != torch.float16:
         vllm_op(k, reference_cache, slot_mapping, quant_block_size, scale_fmt)
     elif flaggems_vllm.vendor_name == "ascend":
@@ -241,12 +240,4 @@ def test_indexer_k_quant_and_cache_matches_reference(
     else:
         torch.cuda.synchronize()
 
-    #torch.save(reference_cache.cpu(), "tensor_file_ref.pt")
-    #torch.save(gems_cache.cpu(), "tensor_file_gems.pt")
-    #if num_tokens == 31:
-    #    a_ref = torch.load("tensor_file_ref.pt", map_location="cpu")
-    #    a_gems = torch.load("tensor_file_gems.pt", map_location="cpu")
-    #    utils.gems_assert_equal(a_ref, reference_cache.cpu())
-    #    utils.gems_assert_equal(a_gems, gems_cache.cpu())
-    #utils.gems_assert_equal(gems_cache.cpu(), utils.to_reference(reference_cache).cpu())
     utils.gems_assert_equal(gems_cache, utils.to_reference(reference_cache))

@@ -16,11 +16,11 @@
 # csrc/cache_kernels.cu::indexer_k_quant_and_cache_kernel
 
 import torch
-import torch_npu
 import triton
 import triton.language as tl
 
 
+# Token from FlagGems-vllm/src/flaggems_vllm/runtime/backend/_ascend/ops/per_token_group_quant_fp8.py
 @triton.jit
 def _f32_to_fp8_e4m3fn(y):
     b = y.to(tl.int32, bitcast=True)
@@ -35,6 +35,15 @@ def _f32_to_fp8_e4m3fn(y):
     return (r | ((b >> 24) & 0x80)).to(tl.uint8)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
+    key=["QUANT_BLOCK_SIZE", "NUM_TOKENS_PAD"],
+)
 @triton.jit
 def _indexer_k_quant_and_cache_kernel(
     k_ptr,
@@ -48,48 +57,44 @@ def _indexer_k_quant_and_cache_kernel(
     head_dim: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
     USE_UE8M0: tl.constexpr,
-    GRID_DIM1: tl.constexpr,
-    PER_CORE_ROWS: tl.constexpr,
-    LAST_CORE_ROWS: tl.constexpr,
+    NUM_TOKENS_PAD: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    row_len = LAST_CORE_ROWS if pid == tl.num_programs(0) - 1 else PER_CORE_ROWS
-    for row_id in tl.range(row_len):
-        grid_id = pid * PER_CORE_ROWS + row_id
-        tid = grid_id // GRID_DIM1
-        quant_block_id = (grid_id % GRID_DIM1) * 4
-        quant_block_offsets = tl.arange(0, 4)
-        head_offsets = tl.arange(0, QUANT_BLOCK_SIZE)
-        offsets = (
-            quant_block_id + quant_block_offsets[:, None]
-        ) * QUANT_BLOCK_SIZE + head_offsets[None, :]
-        mask = offsets < head_dim
+    tid = tl.program_id(0)
+    quant_block_id = tl.program_id(1) * 4
+    quant_block_offsets = tl.arange(0, 4)
+    head_offsets = tl.arange(0, QUANT_BLOCK_SIZE)
+    offsets = (
+        quant_block_id + quant_block_offsets[:, None]
+    ) * QUANT_BLOCK_SIZE + head_offsets[None, :]
+    mask = offsets < head_dim
 
-        src_ptr = k_ptr + tid * head_dim
-        slot_id = tl.load(slot_mapping_ptr + tid)
-        if slot_id >= 0:
-            block_id = slot_id // block_size
-            block_offset = slot_id % block_size
+    src_ptr = k_ptr + tid * head_dim
+    slot_id = tl.load(slot_mapping_ptr + tid)
+    if slot_id < 0:
+        return
 
-            val = tl.load(src_ptr + offsets, mask=mask, other=0.0)
-            amax = tl.max(tl.abs(val).to(tl.float32), axis=1)
-            scale = tl.maximum(1e-4, amax) / 448.0
+    block_id = slot_id // block_size
+    block_offset = slot_id % block_size
 
-            if USE_UE8M0:
-                scale = tl.exp2(tl.ceil(tl.log2(scale)))
+    val = tl.load(src_ptr + offsets, mask=mask, other=0.0)
+    amax = tl.max(tl.abs(val).to(tl.float32), axis=1)
+    scale = tl.maximum(1e-4, amax) / 448.0
 
-            fp8_val = _f32_to_fp8_e4m3fn(val.to(tl.float32) / scale[:, None])
-            dst_ptr = kv_cache_ptr + block_id * kv_cache_value_stride + block_offset * head_dim
-            tl.store(dst_ptr + offsets, fp8_val, mask=mask)
+    if USE_UE8M0:
+        scale = tl.exp2(tl.ceil(tl.log2(scale)))
 
-            dst_scale_ptr = (
-                kv_cache_scale_ptr
-                + block_id * kv_cache_scale_stride
-                + block_offset * num_quant_blocks
-                + quant_block_id
-            )
-            scale_mask = quant_block_id + quant_block_offsets < num_quant_blocks
-            tl.store(dst_scale_ptr + quant_block_offsets, scale, mask=scale_mask)
+    fp8_val = _f32_to_fp8_e4m3fn(val.to(tl.float32) / scale[:, None])
+    dst_ptr = kv_cache_ptr + block_id * kv_cache_value_stride + block_offset * head_dim
+    tl.store(dst_ptr + offsets, fp8_val, mask=mask)
+
+    dst_scale_ptr = (
+        kv_cache_scale_ptr
+        + block_id * kv_cache_scale_stride
+        + block_offset * num_quant_blocks
+        + quant_block_id
+    )
+    scale_mask = quant_block_id + quant_block_offsets < num_quant_blocks
+    tl.store(dst_scale_ptr + quant_block_offsets, scale, mask=scale_mask)
 
 
 def indexer_k_quant_and_cache(
@@ -112,14 +117,8 @@ def indexer_k_quant_and_cache(
     #     "unsupported datatype for arith::TruncFOp to hfusion"
     kv_cache_value = kv_cache_flat[:, : block_size * head_dim].view(torch.uint8)
     kv_cache_scale = kv_cache_flat[:, block_size * head_dim :].view(torch.float32)
-
-    grid_dim1 = triton.cdiv(num_quant_blocks, 4)
-    grid_size = num_tokens * grid_dim1
-    vector_core_num = torch_npu.npu.get_device_properties(k.device.index).vector_core_num
-    per_core_rows = (grid_size + vector_core_num - 1) // vector_core_num
-    need_core_num = (grid_size + per_core_rows - 1) // per_core_rows
-    last_core_rows = per_core_rows if grid_size % per_core_rows == 0 else grid_size % per_core_rows
-    _indexer_k_quant_and_cache_kernel[(need_core_num,)](
+    num_tokens_pad = triton.next_power_of_2(num_tokens)
+    _indexer_k_quant_and_cache_kernel[(num_tokens, triton.cdiv(num_quant_blocks, 4))](
         k,
         kv_cache_value,
         kv_cache_scale,
@@ -131,7 +130,5 @@ def indexer_k_quant_and_cache(
         head_dim,
         quant_block_size,
         USE_UE8M0=scale_fmt == "ue8m0",
-        GRID_DIM1=grid_dim1,
-        PER_CORE_ROWS=per_core_rows,
-        LAST_CORE_ROWS=last_core_rows,
+        NUM_TOKENS_PAD=num_tokens_pad,
     )
