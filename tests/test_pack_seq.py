@@ -14,6 +14,8 @@
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 import flaggems_vllm
 from flaggems_vllm.ops import pack_seq_triton
@@ -22,19 +24,27 @@ from . import accuracy_utils as utils
 from . import conftest as cfg
 
 
+@triton.jit
+def _fp8_check_kernel(x, y):
+    val = tl.load(x)
+    tl.store(y, val)
+
 try:
-    val_fp32 = torch.zeros([1], dtype=torch.float32, device=flaggems_vllm.device)
-    val_fp8 = val_fp32.to(torch.float8_e4m3fn)
-    IS_FP8_SUPPORTED = True
     FP8 = torch.float8_e4m3fn
+    x1 = torch.zeros([1], dtype=FP8, device=flaggems_vllm.device)
+    y1 = torch.empty([1], dtype=FP8, device=flaggems_vllm.device)
+    _fp8_check_kernel[(1,)](x1, y1)
+    IS_FP8_SUPPORTED = True
 except Exception:
     try:
-        val_fp8_2 = val_fp32.to(torch.float8_e5m2)
-        IS_FP8_SUPPORTED = True
         FP8 = torch.float8_e5m2
+        x2 = torch.zeros([1], dtype=FP8, device=flaggems_vllm.device)
+        y2 = torch.empty([1], dtype=FP8, device=flaggems_vllm.device)
+        _fp8_check_kernel[(1,)](x2, y2)
+        IS_FP8_SUPPORTED = True
     except Exception:
-        IS_FP8_SUPPORTED = False
         FP8 = None
+        IS_FP8_SUPPORTED = False
 
 
 def _ref_pack_seq(x, lengths, pad_value=-float("inf")):
