@@ -22,25 +22,21 @@ from . import accuracy_utils as utils
 from . import conftest as cfg
 
 # =============================================================================
-# FP8 availability check
+# CUDA / Hopper check for FP8
 # =============================================================================
 
 
-def is_fp8_available():
-    if not hasattr(torch, "float8_e4m3fn"):
+def is_cuda_available():
+    if flaggems_vllm.device != "cuda":
         return False
-
-    try:
-        torch.zeros(1, device=flaggems_vllm.device, dtype=torch.float32).to(
-            torch.float8_e4m3fn
-        )
-    except (RuntimeError, TypeError, NotImplementedError):
+    if not torch.cuda.is_available():
         return False
+    major, minor = torch.cuda.get_device_capability()
+    sm_version_num = major * 10 + minor
+    return sm_version_num >= 90 and sm_version_num < 100
 
-    return True
 
-
-FP8_AVAILABLE = is_fp8_available()
+CUDA_AVAILABLE = is_cuda_available()
 
 
 def _ref_pack_seq(x, lengths, pad_value=-float("inf")):
@@ -236,8 +232,8 @@ def test_pack_seq_block_sizes(block_t, block_d):
 
 @pytest.mark.pack_seq_triton
 @pytest.mark.skipif(
-    not FP8_AVAILABLE,
-    reason="FP8 is not supported on the current device",
+    not CUDA_AVAILABLE,
+    reason="requires NVIDIA Hopper architecture for FP8",
 )
 @pytest.mark.parametrize(
     "N, H, D, lengths_list",
@@ -263,8 +259,8 @@ def test_pack_seq_fp8_basic(N, H, D, lengths_list):
 
 @pytest.mark.pack_seq_triton
 @pytest.mark.skipif(
-    not FP8_AVAILABLE,
-    reason="FP8 is not supported on the current device",
+    not CUDA_AVAILABLE,
+    reason="requires NVIDIA Hopper architecture for FP8",
 )
 def test_pack_seq_fp8_custom_padding():
     FP8 = torch.float8_e4m3fn
@@ -285,8 +281,8 @@ def test_pack_seq_fp8_custom_padding():
 
 @pytest.mark.pack_seq_triton
 @pytest.mark.skipif(
-    not FP8_AVAILABLE,
-    reason="FP8 is not supported on the current device",
+    not CUDA_AVAILABLE,
+    reason="requires NVIDIA Hopper architecture for FP8",
 )
 def test_pack_seq_fp8_default_inf_padding():
     FP8 = torch.float8_e4m3fn
@@ -301,16 +297,14 @@ def test_pack_seq_fp8_default_inf_padding():
 
 @pytest.mark.pack_seq_triton
 @pytest.mark.skipif(
-    not FP8_AVAILABLE,
-    reason="FP8 is not supported on the current device",
+    not CUDA_AVAILABLE,
+    reason="requires NVIDIA Hopper architecture for FP8",
 )
 @pytest.mark.parametrize("block_t, block_d", [(32, 32), (64, 64), (128, 128)])
 def test_pack_seq_fp8_block_sizes(block_t, block_d):
     FP8 = torch.float8_e4m3fn
     N, H, D = 100, 16, 32
-    lengths = torch.tensor(
-        [25, 25, 25, 25], dtype=torch.int32, device=flaggems_vllm.device
-    )
+    lengths = torch.tensor([25, 25, 25, 25], dtype=torch.int32, device=flaggems_vllm.device)
     x = torch.randn(N, H, D, dtype=torch.float32, device=flaggems_vllm.device) * 0.1
     x_fp8 = x.to(FP8)
     result = pack_seq_triton(x_fp8, lengths, block_t=block_t, block_d=block_d)
@@ -319,3 +313,71 @@ def test_pack_seq_fp8_block_sizes(block_t, block_d):
         expected = x_fp8[b * 25 : b * 25 + 25].to(torch.float32)
         actual = result[b, :25].to(torch.float32)
         torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-2)
+
+
+# =============================================================================
+# INT8 (exploratory -- currently NOT formally supported, see
+# pack_seq_triton_review.md). These tests probe the actual current
+# behavior of pack_seq_triton on int8 input rather than assuming support:
+# there is no dedicated PAD_IS_INT8 branch in pack_seq.py, so int8 output
+# falls into the same float32-padding path used for float dtypes.
+# =============================================================================
+
+
+@pytest.mark.pack_seq_triton
+@pytest.mark.parametrize("pad_value", [-128, -1, 0, 127])
+def test_pack_seq_int8_custom_padding(pad_value):
+    N, D = 20, 16
+    lengths_list = [10, 10]
+    lengths = torch.tensor(lengths_list, dtype=torch.int32, device=flaggems_vllm.device)
+    x = torch.randint(-128, 128, (N, D), dtype=torch.int8, device=flaggems_vllm.device)
+
+    result = pack_seq_triton(x, lengths, pad_value=pad_value)
+
+    assert result.dtype == torch.int8
+    assert result.shape == (2, 10, D)
+
+    for b in range(2):
+        expected = x[b * 10 : b * 10 + 10]
+        actual = result[b, :10]
+        assert torch.equal(actual, expected), f"batch {b} valid region mismatch"
+
+    padded_data = result[:, 10:].to(torch.int32)
+    assert torch.all(padded_data == pad_value), (
+        f"int8 padding with pad_value={pad_value} produced "
+        f"{padded_data.unique().tolist()} instead"
+    )
+
+
+@pytest.mark.pack_seq_triton
+def test_pack_seq_int8_valid_region_with_default_padding():
+    """The valid-token copy must be correct regardless of the (currently
+    ill-defined) default `-inf` padding path for int8."""
+    N, D = 20, 16
+    lengths = torch.tensor([10, 10], dtype=torch.int32, device=flaggems_vllm.device)
+    x = torch.randint(-128, 128, (N, D), dtype=torch.int8, device=flaggems_vllm.device)
+
+    result = pack_seq_triton(x, lengths)
+    assert result.dtype == torch.int8
+
+    for b in range(2):
+        expected = x[b * 10 : b * 10 + 10]
+        actual = result[b, :10]
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.pack_seq_triton
+def test_pack_seq_int8_out_of_range_padding_is_unvalidated():
+    """There is currently no range check for int8 pad_value. This test
+    documents that an out-of-range value (e.g. 200) is silently accepted
+    today instead of raising -- a gap called out in the review."""
+    N, D = 20, 16
+    lengths = torch.tensor([10, 10], dtype=torch.int32, device=flaggems_vllm.device)
+    x = torch.randint(-128, 128, (N, D), dtype=torch.int8, device=flaggems_vllm.device)
+
+    result = pack_seq_triton(x, lengths, pad_value=200)
+    assert result.dtype == torch.int8
+    for b in range(2):
+        expected = x[b * 10 : b * 10 + 10]
+        actual = result[b, :10]
+        assert torch.equal(actual, expected)
