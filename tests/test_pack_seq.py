@@ -21,22 +21,11 @@ from flaggems_vllm.ops import pack_seq_triton
 from . import accuracy_utils as utils
 from . import conftest as cfg
 
-# =============================================================================
-# CUDA / Hopper check for FP8
-# =============================================================================
 
-
-def is_cuda_available():
-    if flaggems_vllm.device != "cuda":
-        return False
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    sm_version_num = major * 10 + minor
-    return sm_version_num >= 90 and sm_version_num < 100
-
-
-CUDA_AVAILABLE = is_cuda_available()
+if flaggems_vllm.vendor_name == "thead":
+    FP8 = torch.float8_e5m2
+else:
+    FP8 = torch.float8_e4m3fn
 
 
 def _ref_pack_seq(x, lengths, pad_value=-float("inf")):
@@ -231,16 +220,11 @@ def test_pack_seq_block_sizes(block_t, block_d):
 
 
 @pytest.mark.pack_seq_triton
-@pytest.mark.skipif(
-    not CUDA_AVAILABLE,
-    reason="requires NVIDIA Hopper architecture for FP8",
-)
 @pytest.mark.parametrize(
     "N, H, D, lengths_list",
     [(6, 8, 4, [3, 3]), (10, 4, 8, [2, 4, 4]), (20, 16, 32, [5, 5, 5, 5])],
 )
 def test_pack_seq_fp8_basic(N, H, D, lengths_list):
-    FP8 = torch.float8_e4m3fn
     lengths = torch.tensor(lengths_list, dtype=torch.int32, device=flaggems_vllm.device)
     B = len(lengths_list)
     Lmax = max(lengths_list)
@@ -258,12 +242,7 @@ def test_pack_seq_fp8_basic(N, H, D, lengths_list):
 
 
 @pytest.mark.pack_seq_triton
-@pytest.mark.skipif(
-    not CUDA_AVAILABLE,
-    reason="requires NVIDIA Hopper architecture for FP8",
-)
 def test_pack_seq_fp8_custom_padding():
-    FP8 = torch.float8_e4m3fn
     N, H, D = 20, 8, 16
     lengths = torch.tensor([10, 10], dtype=torch.int32, device=flaggems_vllm.device)
     x = torch.randn(N, H, D, dtype=torch.float32, device=flaggems_vllm.device) * 0.1
@@ -280,12 +259,7 @@ def test_pack_seq_fp8_custom_padding():
 
 
 @pytest.mark.pack_seq_triton
-@pytest.mark.skipif(
-    not CUDA_AVAILABLE,
-    reason="requires NVIDIA Hopper architecture for FP8",
-)
 def test_pack_seq_fp8_default_inf_padding():
-    FP8 = torch.float8_e4m3fn
     N, H, D = 20, 8, 16
     lengths = torch.tensor([10, 10], dtype=torch.int32, device=flaggems_vllm.device)
     x = torch.randn(N, H, D, dtype=torch.float32, device=flaggems_vllm.device) * 0.1
@@ -296,13 +270,8 @@ def test_pack_seq_fp8_default_inf_padding():
 
 
 @pytest.mark.pack_seq_triton
-@pytest.mark.skipif(
-    not CUDA_AVAILABLE,
-    reason="requires NVIDIA Hopper architecture for FP8",
-)
 @pytest.mark.parametrize("block_t, block_d", [(32, 32), (64, 64), (128, 128)])
 def test_pack_seq_fp8_block_sizes(block_t, block_d):
-    FP8 = torch.float8_e4m3fn
     N, H, D = 100, 16, 32
     lengths = torch.tensor([25, 25, 25, 25], dtype=torch.int32, device=flaggems_vllm.device)
     x = torch.randn(N, H, D, dtype=torch.float32, device=flaggems_vllm.device) * 0.1

@@ -31,24 +31,12 @@ try:
 except ImportError:
     HAS_VLLM = False
 
-# =============================================================================
-# CUDA available check for FP8
-# =============================================================================
 
+if flaggems_vllm.vendor_name == "thead":
+    FP8_DTYPE = torch.float8_e5m2
+else:
+    FP8_DTYPE = torch.float8_e4m3fn
 
-def is_cuda_available():
-    if flaggems_vllm.device != "cuda":
-        return False
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    sm_version_num = major * 10 + minor
-    return sm_version_num >= 90 and sm_version_num < 100
-
-
-CUDA_AVAILABLE = is_cuda_available()
-
-FP8_DTYPE = torch.float8_e4m3fn if CUDA_AVAILABLE else None
 
 # =============================================================================
 # Benchmark shapes: (N, D, B, lengths_list)
@@ -174,8 +162,8 @@ class PackSeqINT8Benchmark(base.Benchmark):
 
 @pytest.mark.pack_seq_triton
 @pytest.mark.skipif(
-    not (HAS_VLLM and CUDA_AVAILABLE),
-    reason="requires vLLM and NVIDIA Hopper architecture for FP8",
+    not HAS_VLLM,
+    reason="requires vLLM to be installed for reference comparison",
 )
 def test_pack_seq_fp8():
     bench = PackSeqFP8Benchmark(
