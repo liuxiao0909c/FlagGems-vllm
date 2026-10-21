@@ -71,6 +71,7 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
+from flaggems_vllm.ops.fused_kda_gate import fused_kda_gate
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.ops.fused_moe import (
     dispatch_fused_moe_kernel,
@@ -267,6 +268,7 @@ __all__ = [
     "fused_experts_impl",
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
+    "fused_kda_gate",
     "fused_marlin_moe",
     "fused_minimax_m3_qknorm_rope_kv_insert",
     "fused_q_kv_rmsnorm",
