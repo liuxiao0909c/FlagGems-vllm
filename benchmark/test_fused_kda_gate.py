@@ -39,13 +39,12 @@ class FusedKdaGateBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         configs = [
             (T, H, D, lower_bound)
-            #for T in [1, 8, 64, 300]
-            for T in [1, 8, 64, 1024, 4096, 32768, 65536]
-            #for T in [65536]
-            #for H in [8, 96]
-            for H in [8]
-            #for D in [64, 128]
-            for D in [128]
+            for T in [1, 8, 64, 300]
+            #for T in [1, 8, 64, 1024, 4096, 32768, 65536]
+            for H in [8, 96]
+            #for H in [8]
+            for D in [64, 128]
+            #for D in [128]
             for lower_bound in [-5.0, None]
             #for lower_bound in [-5.0]
         ]
