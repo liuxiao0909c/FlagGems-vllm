@@ -99,6 +99,7 @@ from flaggems_vllm.ops.mhc import (
     mhc_bwd_ref,
     mhc_post,
     mhc_pre,
+    mhc_shifted_post_pre_deep_gemm,
     sinkhorn_forward,
 )
 from flaggems_vllm.ops.qwen4 import (
