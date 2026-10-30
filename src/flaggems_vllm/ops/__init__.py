@@ -308,6 +308,7 @@ __all__ = [
     "mhc_pre",
     "mhc_pre_with_norm",
     "mhc_rms_norm",
+    "mhc_shifted_post_pre_deep_gemm",
     "MixLayout",
     "moe_align_block_size",
     "moe_align_block_size_no_tle",

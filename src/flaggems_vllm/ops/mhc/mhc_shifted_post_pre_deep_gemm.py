@@ -61,11 +61,11 @@ def mhc_shifted_post_pre_deep_gemm(
 
     T, H = x.shape
     assert x.dtype == torch.bfloat16 and x.is_contiguous()
-    assert T, NUM_ROUTES, H == residual.shape and residual.dtype == torch.bfloat16 and residual.is_contiguous()
-    assert T, NUM_ROUTES == shifted_prev_mix.shape and shifted_prev_mix.dtype == torch.float and shifted_prev_mix.is_contiguous()
-    assert T, NUM_ROUTES, 1 == post_mix.shape and post_mix.dtype == torch.float and post_mix.is_contiguous()
-    assert T, NUM_ROUTES, NUM_ROUTES == comb_res_mix.shape and comb_res_mix.dtype == torch.float and comb_res_mix.is_contiguous()
-    assert NUM_HC_OUTPUTS, NUM_ROUTES*H == fn.shape and fn.dtype == torch.float and fn.is_contiguous()
+    assert (T, NUM_ROUTES, H) == residual.shape and residual.dtype == torch.bfloat16 and residual.is_contiguous()
+    assert (T, NUM_ROUTES) == shifted_prev_mix.shape and shifted_prev_mix.dtype == torch.float and shifted_prev_mix.is_contiguous()
+    assert (T, NUM_ROUTES, 1) == post_mix.shape and post_mix.dtype == torch.float and post_mix.is_contiguous()
+    assert (T, NUM_ROUTES, NUM_ROUTES) == comb_res_mix.shape and comb_res_mix.dtype == torch.float and comb_res_mix.is_contiguous()
+    assert (NUM_HC_OUTPUTS, NUM_ROUTES*H) == fn.shape and fn.dtype == torch.float and fn.is_contiguous()
     assert 3 == mix_scales.shape and mix_scales.dtype == torch.float and mix_scales.is_contiguous()
     assert NUM_HC_OUTPUTS == mix_bases.shape and mix_bases.dtype == torch.float and mix_bases.is_contiguous()
 

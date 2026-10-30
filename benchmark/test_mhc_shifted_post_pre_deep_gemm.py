@@ -1,0 +1,248 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pytest
+import torch
+import triton
+import triton.language as tl
+
+import flaggems_vllm
+
+from . import base
+
+DEVICE = flaggems_vllm.device
+
+
+def _sinkhorn_reference(value: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
+    value = value.softmax(dim=-1) + eps
+    value = value / (value.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(repeat - 1):
+        value = value / (value.sum(dim=-1, keepdim=True) + eps)
+        value = value / (value.sum(dim=-2, keepdim=True) + eps)
+    return value
+
+
+# Reference to https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_mega_mhc.py
+def torch_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    shifted_prev_mix: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    mix_scales: torch.Tensor,
+    mix_bases: torch.Tensor,
+    hc_norm_eps: float,
+    hc_pre_eps: float,
+    hc_post_scale: float,
+    sinkhorn_eps: float,
+    num_sinkhorn_iters: int,
+    rmsnorm_weight: torch.Tensor,
+    rmsnorm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    hc_mult = residual.shape[1]
+    new_residual = x.float().unsqueeze(1) * post_mix
+    new_residual += torch.einsum(
+        'tij,tih->tjh', comb_res_mix, residual.float())
+    new_residual = new_residual.bfloat16()
+    if shifted_prev_mix is None:
+        norm_input = None
+    else:
+        shifted_prev_mix = shifted_prev_mix.unsqueeze(-1)
+        norm_input = (new_residual.float() * shifted_prev_mix).sum(dim=1).bfloat16()
+
+    old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        mixes = new_residual.flatten(1).float() @ fn.mT
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
+    hc_sqr_sum = new_residual.float().square().sum((1, 2))
+    mixes *= torch.rsqrt(
+        hc_sqr_sum / (hc_mult * x.size(1)) + hc_norm_eps).unsqueeze(1)
+    scales = torch.cat((
+        mix_scales[0].expand(hc_mult),
+        mix_scales[1].expand(hc_mult),
+        mix_scales[2].expand(hc_mult * hc_mult),
+    ))
+    mixes = mixes * scales + mix_bases
+    new_prev_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(2) + hc_pre_eps
+    new_post_mix = (
+        mixes[:, hc_mult:2 * hc_mult].sigmoid() * hc_post_scale
+    ).unsqueeze(2)
+    new_comb_res_mix = _sinkhorn_reference(
+        mixes[:, 2 * hc_mult:].view(-1, hc_mult, hc_mult),
+        num_sinkhorn_iters,
+        sinkhorn_eps,
+    )
+    if norm_input is None:
+        norm_input = (new_residual.float() * new_prev_mix).sum(dim=1).bfloat16()
+
+    norm_input_float = norm_input.float()
+    y_bf16 = (
+        norm_input_float
+        * torch.rsqrt(norm_input_float.square().mean(1) + rmsnorm_eps).unsqueeze(1)
+        * (rmsnorm_weight.float())
+    ).bfloat16()
+    return (
+        new_residual,
+        new_post_mix,
+        new_comb_res_mix,
+        y_bf16,
+        new_prev_mix.squeeze(-1),
+    )
+
+
+try:
+    from vllm.models.deepseek_v41.nvidia.ops.mega_mhc import (
+        is_mega_mhc_supported,
+        mhc_shifted_post_pre_deep_gemm as vllm_impl_deepgemm,
+    )
+except ImportError:
+    is_mega_mhc_supported = None
+    vllm_impl_deepgemm = None
+
+
+try:
+    import vllm._custom_ops  # noqa: F401
+    if hasattr(torch.ops.vllm, "mhc_fused_post_pre_delayed_tilelang"):
+        vllm_impl_tilelang = torch.ops.vllm.mhc_fused_post_pre_delayed_tilelang
+    else:
+        vllm_impl_tilelang = None
+except ImportError:
+    vllm_impl_tilelang = None
+
+
+def ref_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    shifted_prev_mix: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    mix_scales: torch.Tensor,
+    mix_bases: torch.Tensor,
+    hc_norm_eps: float,
+    hc_pre_eps: float,
+    hc_post_scale: float,
+    sinkhorn_eps: float,
+    num_sinkhorn_iters: int,
+    rmsnorm_weight: torch.Tensor,
+    rmsnorm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    impl = None
+    if is_mega_mhc_supported is not None and vllm_impl_deepgemm is not None:
+        _, hc_mult, hidden_size = residual.shape
+        if is_mega_mhc_supported(hidden_size, hc_mult):
+            impl = vllm_impl_deepgemm
+    if impl is None and vllm_impl_tilelang is not None:
+        return vllm_impl_tilelang(
+            x,
+            residual,
+            post_mix,
+            comb_res_mix,
+            fn,
+            mix_scales,
+            mix_bases,
+            hc_norm_eps,
+            hc_pre_eps,
+            sinkhorn_eps,
+            hc_post_scale,
+            num_sinkhorn_iters,
+            pre_mix=shifted_prev_mix,
+            norm_weight=rmsnorm_weight,
+            norm_eps=rmsnorm_eps,
+            capture_aux=False,
+        )[:5]
+
+    impl = impl if impl is not None else torch_impl
+    return impl(
+        x,
+        residual,
+        shifted_prev_mix,
+        post_mix,
+        comb_res_mix,
+        fn,
+        mix_scales,
+        mix_bases,
+        hc_norm_eps,
+        hc_pre_eps,
+        hc_post_scale,
+        sinkhorn_eps,
+        num_sinkhorn_iters,
+        rmsnorm_weight,
+        rmsnorm_eps,
+    )
+
+
+class MHCShiftedPostPreDeepGEMMBenchmark(base.Benchmark):
+    DEFAULT_DTYPES = [torch.bfloat16]
+
+    def __init__(self, op_name, torch_op, dtypes):
+        super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (num_tokens, hidden_size)
+            for num_tokens in [1, 17, 65, 200, 1025, 4096, 32768]
+            for hidden_size in [4096, 5120, 7168]
+        ]
+
+    def get_input_iter(self, cur_dtype):
+        for config in self.shapes:
+            yield from self._input_fn(config, cur_dtype)
+
+    def _input_fn(self, config, dtype):
+        num_tokens, hidden_size = config
+        DEVICE = flaggems_vllm.device
+        hc_mult = 4
+        num_hc_outputs = hc_mult * (hc_mult + 2)
+        x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=DEVICE)
+        residual = torch.randn(num_tokens, hc_mult, hidden_size, dtype=dtype, device=DEVICE)
+        shifted_prev_mix = torch.rand(num_tokens, hc_mult, device=DEVICE)
+        post_mix = torch.rand(num_tokens, hc_mult, 1, device=DEVICE)
+        comb_res_mix = torch.rand(num_tokens, hc_mult, hc_mult, device=DEVICE)
+        fn = torch.randn(num_hc_outputs, hc_mult * hidden_size, device=DEVICE) * 0.01
+        mix_scales = torch.randn(3, device=DEVICE) * 0.1
+        mix_bases = torch.randn(num_hc_outputs, device=DEVICE) * 0.1
+        rmsnorm_weight = torch.empty(hidden_size, dtype=dtype, device=DEVICE).uniform_(0.9, 1.1)
+        args = (
+            x,
+            residual,
+            shifted_prev_mix,
+            post_mix,
+            comb_res_mix,
+            fn,
+            mix_scales,
+            mix_bases,
+            2e-5, # hc_norm_eps
+            3e-4, # hc_pre_eps
+            1.25, # hc_post_scales
+            2e-6, # sinkhorn_eps
+            10, # num_sinkhorn_iters
+            rmsnorm_weight,
+            7e-6, # rmsnorm_eps
+        )
+        yield args
+
+
+@pytest.mark.mhc_shifted_post_pre_deep_gemm
+def test_mhc_shifted_post_pre_deep_gemm():
+    bench = MHCShiftedPostPreDeepGEMMBenchmark(
+        op_name="mhc_shifted_post_pre_deep_gemm",
+        torch_op=ref_impl,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(flaggems_vllm.mhc_shifted_post_pre_deep_gemm)
+    bench.run()
