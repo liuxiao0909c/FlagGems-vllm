@@ -186,7 +186,7 @@ def ref_impl(
     )
 
 
-class MHCShiftedPostPreDeepGEMMBenchmark(base.Benchmark):
+class MhcShiftedPostPreDeepGEMMBenchmark(base.Benchmark):
     DEFAULT_DTYPES = [torch.bfloat16]
 
     def __init__(self, op_name, torch_op, dtypes):
@@ -239,7 +239,7 @@ class MHCShiftedPostPreDeepGEMMBenchmark(base.Benchmark):
 
 @pytest.mark.mhc_shifted_post_pre_deep_gemm
 def test_mhc_shifted_post_pre_deep_gemm():
-    bench = MHCShiftedPostPreDeepGEMMBenchmark(
+    bench = MhcShiftedPostPreDeepGEMMBenchmark(
         op_name="mhc_shifted_post_pre_deep_gemm",
         torch_op=ref_impl,
         dtypes=[torch.bfloat16],

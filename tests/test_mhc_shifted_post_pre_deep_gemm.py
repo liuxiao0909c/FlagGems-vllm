@@ -231,8 +231,8 @@ def test_vllm_case(num_tokens, hidden_size):
     )
     #import pdb; pdb.set_trace()
     expected = ref_impl(*args)
-    #result = flaggems_vllm.mhc_shifted_post_pre_deep_gemm(*args)
-    result = torch_impl(*args)
+    result = flaggems_vllm.mhc_shifted_post_pre_deep_gemm(*args)
+    #result = torch_impl(*args)
     for i, (res, ref) in enumerate(zip(result, expected, strict=True)):
         atol, rtol = (1.6e-2, 1e-2) if i in (0, 3) else (1e-6, 1e-3)
         torch.testing.assert_close(res, ref, atol=atol, rtol=rtol)
@@ -274,8 +274,8 @@ def test_deepgemm_case(num_tokens, hidden_size):
     )
     #import pdb; pdb.set_trace()
     expected = ref_impl(*args)
-    #result = flaggems_vllm.mhc_shifted_post_pre_deep_gemm(*args)
-    result = torch_impl(*args)
+    result = flaggems_vllm.mhc_shifted_post_pre_deep_gemm(*args)
+    #result = torch_impl(*args)
     for i, (res, ref) in enumerate(zip(result, expected, strict=True)):
         atol, rtol = (1.6e-2, 1e-2) if i in (0, 3) else (1e-6, 1e-3)
         torch.testing.assert_close(res, ref, atol=atol, rtol=rtol)
