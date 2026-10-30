@@ -58,15 +58,11 @@ def ref_impl(
     rmsnorm_weight: torch.Tensor,
     rmsnorm_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    impl = None
-    if is_mega_mhc_supported is not None and vllm_impl_deepgemm is not None:
-        _, hc_mult, hidden_size = residual.shape
-        if is_mega_mhc_supported(hidden_size, hc_mult):
-            impl = vllm_impl_deepgemm
-    if impl is None and vllm_impl_tilelang is not None:
-        return vllm_impl_tilelang(
+    if vllm_impl_deepgemm is not None:
+        return vllm_impl_deepgemm(
             x,
             residual,
+            shifted_prev_mix,
             post_mix,
             comb_res_mix,
             fn,
@@ -74,19 +70,15 @@ def ref_impl(
             mix_bases,
             hc_norm_eps,
             hc_pre_eps,
-            sinkhorn_eps,
             hc_post_scale,
+            sinkhorn_eps,
             num_sinkhorn_iters,
-            pre_mix=shifted_prev_mix,
-            norm_weight=rmsnorm_weight,
-            norm_eps=rmsnorm_eps,
-            capture_aux=False,
-        )[:5]
-     assert impl is not None
-     return impl(
+            rmsnorm_weight,
+            rmsnorm_eps,
+        )		
+    return vllm_impl_tilelang(
         x,
         residual,
-        shifted_prev_mix,
         post_mix,
         comb_res_mix,
         fn,
@@ -94,12 +86,14 @@ def ref_impl(
         mix_bases,
         hc_norm_eps,
         hc_pre_eps,
-        hc_post_scale,
         sinkhorn_eps,
+        hc_post_scale,
         num_sinkhorn_iters,
-        rmsnorm_weight,
-        rmsnorm_eps,
-    )
+        pre_mix=shifted_prev_mix,
+        norm_weight=rmsnorm_weight,
+        norm_eps=rmsnorm_eps,
+        capture_aux=False,
+    )[:5]
 
 
 def native():
@@ -112,7 +106,7 @@ def native():
 
 
 def grid():
-    # num_tokens, hidden_state 
+    # num_tokens, hidden_size 
     return [
         (num_tokens, hidden_size)
         for num_tokens in [1, 17, 65, 200, 1025, 4096, 32768]
@@ -155,32 +149,41 @@ def build_inputs(binding, dtype, device):
 
 def key_shape(binding):
     num_tokens, hidden_size = binding
-    return [num_tokenshidden_size]
+    return [num_tokens, hidden_size]
 
 
 def config(binding, dtype):
-    num_tokens, num_experts, n_group, topk_group, topk, renormalize, scoring_func = (
-        binding
-    )
+    T, H = binding
+    hc_mult = 4
+    num_hc_outputs = hc_mult * (hc_mult + 2)
     dtype_name = str(dtype)
     return {
         "inputs": {
-            "scores": {"shape": [num_tokens, num_experts], "dtype": dtype_name},
-            "n_group": {"scalar": n_group},
-            "topk_group": {"scalar": topk_group},
-            "topk": {"scalar": topk},
-            "renormalize": {"scalar": renormalize},
-            "routed_scaling_factor": {"scalar": 1.0},
-            "bias": {"shape": [num_experts], "dtype": "torch.float32"},
-            "scoring_func": {"scalar": scoring_func},
+            "x": {"shape": [T, H], "dtype": dtype_name},
+            "residual": {"shape": [T, hc_mult, H], "dtype": dtype_name},
+            "shifted_prev_mix": {"shape": [T, hc_mult], "dtype": "torch.float32"},
+            "post_mix": {"shape": [T, hc_mult, 1], "dtype": "torch.float32"},
+            "comb_res_mix": {"shape": [T, hc_mult, hc_mult], "dtype": "torch.float32"},
+            "fn": {"shape": [num_hc_outputs, hc_mult * H], "dtype": "torch.float32"},
+            "mix_scales": {"shape": [3], "dtype": "torch.float32"},
+            "mix_bases": {"shape": [num_hc_outputs], "dtype": "torch.float32"},
+            "hc_norm_eps": {"scalar": 2e-5},
+            "hc_pre_eps": {"scalar": 3e-4},
+            "hc_post_scales": {"scalar": 1.25},
+            "sinkhorn_eps": {"scalar": 2e-6},
+            "num_sinkhorn_iters": {"scalar": 10},
+            "rmsnorm_weight": {"shape": [H], "dtype": dtype_name},
+            "rmsnorm_eps": {"scalar":7e-6},
         },
         "outputs": {
-            "topk_weights": {"shape": [num_experts, topk], "dtype": "torch.float32"},
-            "topk_ids": {"shape": [num_experts, topk], "dtype": "torch.int32"},
+            "new_residual": {"shape": [T, hc_mult, H], "dtype": dtype_name},
+            "new_post_mix": {"shape": [T, hc_mult, 1], "dtype": "torch.float32"},
+            "new_comb_res_mix": {"shape": [T, hc_mult, hc_mult], "dtype": "torch.float32"},
+            "y_bf16": {"shape": [T, H], "dtype": dtype_name},
+            "new_prev_mix": {"shape": [T, hc_mult], "dtype": "torch.float32"},
         },
         "dims": {
             "T": num_tokens,
             "H": hidden_size,
         },
     }
-
