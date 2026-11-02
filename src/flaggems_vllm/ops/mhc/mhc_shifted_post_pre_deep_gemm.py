@@ -30,6 +30,227 @@ NUM_HC_OUTPUTS = NUM_ROUTES * (NUM_ROUTES + 2)
 NUM_MAX_TOKENS = 1 << 20
 
 
+NUM_WARPS_AUTOTUNE = [2, 4, 8, 16]
+BH_LIST_AUTOTUNE = [1024, 512, 256]
+BK_LIST_AUTOTUNE = [1024, 512, 256]
+BT_LIST_AUTOTUNE = [1, 8]
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_T": bt, "BLOCK_SIZE_H": bh}, num_warps=nw, num_stages=ns)
+        for bt in BT_LIST_AUTOTUNE
+        for bh in BH_LIST_AUTOTUNE
+        for nw in NUM_WARPS_AUTOTUNE
+        for ns in [1]
+    ],
+    key=["T_PAD", "H"],
+)
+@triton.jit
+def triton_mhc_shifted_post_pre_kernel(
+    x_ptr,
+    residual_ptr,
+    shifted_prev_mix_ptr,
+    post_mix_ptr,
+    comb_res_mix_ptr,
+    fn_ptr,
+    mix_scales_ptr,
+    mix_bases_base,
+    hc_norm_eps,
+    hc_pre_eps,
+    hc_post_scale,
+    sinkhorn_eps,
+    num_sinkhorn_iters,
+    rmsnorm_weight_ptr,
+    rmsnorm_eps,
+    new_residual_ptr,
+    new_post_mix_ptr,
+    new_comb_res_mix_ptr,
+    y_bf16_ptr,
+    new_prev_mix_ptr,
+    T,
+    T_PAD: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+):
+    HC_MULT: tl.constexpr = 4
+    
+    pid_t, pid_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    t_offs = pid_t * BLOCK_SIZE_T + tl.arange(0, BLOCK_SIZE_T)
+    h_offs = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
+    hc_mult_offs = tl.arange(0, HC_MULT)
+    norm_input_ptr = y_bf16_ptr  # both [T, H]
+    
+    x = tl.load(
+        x_ptr + t_offs[:, None] * H + h_offs[None, :],
+        mask=(t_offs[:, None] < T) & (h_offs[None, :] < H),
+        other=0.0,
+    ).to(tl.float32).expand_dims(1)  # [BLOCK_SIZE_T, 1, BLOCK_SIZE_H]
+    post_mix = tl.load(
+        post_mix_ptr + t_offs[:, None] * HC_MULT + hc_mult_offs[None, :],
+        mask=t_offs[:, None] < T,
+        other=0.0,
+    )[:, :, None]  # [BLOCK_SIZE_T, HC_MULT, 1]
+    new_residual = x * post_mix  # [BLOCK_SIZE_T, HC_MULT, BLOCK_SIZE_H]
+    residual = tl.load(
+        residual_ptr + t_offs[:, None, None] * HC_MULT * H + hc_mult_offs[None, :, None] * H + h_offs[None, None, :],
+        mask=(t_offs[:, None, None] < T) & (h_offs[None, None, :] < H),
+        other=0.0,
+    ).to(tl.float32)  # [BLOCK_SIZE_T, HC_MULT, BLOCK_SIZE_H]
+    comb_res_mix = tl.load(
+        comb_res_mix_ptr + t_offs[:, None, None] * HC_MULT * HC_MULT + hc_mult_offs[None, :, None] * HC_MULT + hc_mult_offs[None, None, :],
+        mask=t_offs[:, None, None] < T,
+        other=0.0,
+    )  # [BLOCK_SIZE_T, HC_MULT, HC_MULT]
+    # 'tij,tih->tjh'
+    new_residual = tl.dot(comb_res_mix.trans(0, 2, 1), residual, acc=new_residual)  # [BLOCK_SIZE_T, HC_MULT, BLOCK_SIZE_H]   
+ 
+    shifted_prev_mix = tl.load(
+        shifted_prev_mix_ptr + t_offs[:, None] * HC_MULT + hc_mult_offs[None, :],
+        mask=t_offs[:, None] < T,
+        other=0.0,
+    )[:, :, None]  # [BLOCK_SIZE_T, HC_MULT, 1]
+    norm_input = tl.sum(new_residual * shifted_prev_mix, dim=1)  # [BLOCK_SIZE_T, BLOCK_SIZE_H]
+    tl.store(
+       norm_input_ptr + t_offs[:, None] * H + h_offs[None, :],
+       norm_input.to(tl.bfloat16),
+       mask=(t_offs[:, None] < T) & (h_offs[None, :] < H),
+    )
+    tl.store(
+       new_residual_ptr + t_offs[:, None, None] * HC_MULT * H + hc_mult_offs[None, :, None] * H + h_offs[None, None, :],
+       new_residual.to(tl.bfloat16),
+       mask=(t_offs[:, None, None] < T) & (h_offs[None, None, :] < H),
+    )
+
+
+@triton.git
+def _softmax(x, dim):
+    max_val = tl.max(x, axis=dim, keep_dim=True)
+    x_minus_max = x - max_val
+    exp_x = tl.exp(x_minus_max)
+    sum_exp = tl.sum(exp_x, axis=dim)
+    return exp_x / sum_exp
+    
+@triton.git
+def _sinkhorn_reference(value, repeat, eps):
+    value = _softmax(value, -1) + eps
+    value = value / (tl.sum(value, axis=-2, keep_dim=True) + eps)
+    for _ in range(repeat - 1):
+        value = value / (tl.sum(value, axis=-1, keep_dim=True) + eps)
+        value = value / (tl.sum(value, axis=-2, keep_dim=True) + eps)
+    return value
+   
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_T": bt, "BLOCK_SIZE_K": bk}, num_warps=nw, num_stages=ns)
+        for bt in BT_LIST_AUTOTUNE
+        for bk in BK_LIST_AUTOTUNE
+        for nw in NUM_WARPS_AUTOTUNE
+        for ns in [1, 2, 3]
+    ],
+    key=["T_PAD", "H"],
+)
+@triton.jit
+def triton_mhc_shifted_post_pre_kernel2(
+    x_ptr,
+    residual_ptr,
+    shifted_prev_mix_ptr,
+    post_mix_ptr,
+    comb_res_mix_ptr,
+    fn_ptr,
+    mix_scales_ptr,
+    mix_bases_base,
+    hc_norm_eps,
+    hc_pre_eps,
+    hc_post_scale,
+    sinkhorn_eps,
+    num_sinkhorn_iters,
+    rmsnorm_weight_ptr,
+    rmsnorm_eps,
+    new_residual_ptr,
+    new_post_mix_ptr,
+    new_comb_res_mix_ptr,
+    y_bf16_ptr,
+    new_prev_mix_ptr,
+    T,
+    T_PAD: tl.constexpr,
+    H: tl.constexpr,
+    H_PAD: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    HC_MULT: tl.constexpr = 4
+    K: tl.constexpr = HC_MULT * H
+    norm_input_ptr = y_bf16_ptr  # both [T, H]
+
+    pid_t = tl.program_id(0).to(tl.int64)
+    t_offs = pid_t * BLOCK_SIZE_T + tl.arange(0, BLOCK_SIZE_T)
+    fn0_offs = tl.arange(0, HC_MULT * 2)
+    fn1_offs = tl.arange(0, HC_MULT * HC_MULT)
+
+    mixed0 = tl.zeros([BLOCK_SIZE_T, HC_MULT * 2], dtype=tl.float32)
+    mixed1 = tl.zeros([BLOCK_SIZE_T, HC_MULT * HC_MULT], dtype=tl.float32)
+    cnt = (HC_MULT * H + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    hc_sqr_sum = tl.zeros([BLOCK_SIZE_T], dtype=tl.float32)
+    for split_k in tl.range(0, cnt):
+        k_offs = BLOCK_SIZE_K * split_k + tl.arange(0, BLOCK_SIZE_K)
+        new_residual = tl.load(
+            new_residual_ptr + t_offs[:, None] * K + k_offs[None, :],
+            mask=(t_offs[:, None] < T) & (k_offs[None, :] < K),
+            other=0.0,
+        ).to(tl.float32)  # [BLOCK_SIZE_T, BLOCK_SIZE_K]
+        hc_sqr_sum += tl.sum(new_residual * new_residual, axis=1)  # [BLOCK_SIZE_T]
+
+        fn0 = tl.load(
+            fn_ptr + fn0_offs[:, None] * K + k_offs[None, :],
+            mask=k_offs[None, :] < K,
+            other=0.0,
+        )  # [HC_MULT * 2, BLOCK_SIZE_K]
+        mixed0 = tl.dot(new_residual, tl.trans(fn0), acc=mixed0, input_precision="ieee")  # [BLOCK_SIZE_T, HC_MULT * 2]
+        fn1 = tl.load(
+            fn_ptr + (HC_MULT * 2 + fn1_offs[:, None]) * K + k_offs[None, :],
+            mask=k_offs[None, :] < K,
+            other=0.0,
+        )  # [HC_MULT * HC_MULT, BLOCK_SIZE_K]
+        mixed1 = tl.dot(new_residual, tl.trans(fn1), acc=mixed1, input_precision="ieee")  # [BLOCK_SIZE_T, HC_MULT * HC_MULT]
+
+    rsqrt = tl.rsqrt(hc_sqr_sum / (HC_MULT * H) + hc_norm_eps)
+    mixed0 *= rsqrt
+    mixed1 *= rsqrt
+    mix_scale0 = tl.load(mix_scales_ptr + tl.arange(0, 2))  # [2]
+    mix_base0 = tl.load(mix_bases_ptr + fn0_offs)  # [HC_MULT * 2]
+    mixed0 = (mixed0.reshape(BLOCK_SIZE_T, 2, HC_MULT) * mix_scale0[None, :, None] + mix_base0.reshape(2, HC_MULT)[None, :, :]).reshape(BLOCK_SIZE_T, HC_MULT * 2)  # [BLOCK_SIZE_T, HC_MULT * 2]
+    mix_scale1 = tl.load(mix_scales_ptr + 2)
+    mix_base1 = tl.load(mix_bases_ptr + HC_MULT * 2 + fn1_offs)  # [HC_MULT * HC_MULT]
+    mixed1 = mixed1 * mix_scale1 + mix_base1[None, :]  # [BLOCK_SIZE_T, HC_MULT * HC_MULT]
+     
+    new_prev_mix = tl.sigmoid(mixed1) + hc_pre_eps  # [BLOCK_SIZE_T, HC_MULT * HC_MULT]
+    tl.store(new_prev_mix_ptr + t_offs[:, None] * HC_MULT * HC_MULT + fn1_offs[None, :], new_prev_mix, mask=t_offs[:, None] < T)
+    new_post_mix = tl.sigmoid(mixed0) * hc_post_scale  # [BLOCK_SIZE_T, HC_MULT * 2]
+    tl.store(new_post_mix_ptr + t_offs[:, None] * HC_MULT * 2 + fn0_offs[None, :], new_post_mix, mask=t_offs[:, None] < T)
+    new_comb_res_mix = _sinkhorn_reference(mixed1.reshape(BLOCK_SIZE_T, HC_MULT, HC_MULT), num_sinkhorn_iters, sinkhorn_eps)  # [BLOCK_SIZE_T, HC_MULT, HC_MULT]
+    tl.store(new_comb_res_mix_ptr + t_offs[:, None] * HC_MULT * HC_MULT + fn1_offs[None, :], new_comb_res_mix_ptr, mask=t_offs[:, None] < T)
+    h_offs = tl.arange(0, H_PAD)
+    norm_input = tl.load(
+        norm_input_ptr + t_offs[:, None] * H + h_offs[None, :],
+        mask=(t_offs[:, None] < T) & (h_offs < H),
+        other=0.0,
+    ).to(tl.float32)  # [BLOCK_SIZE_T, H_PAD]
+    rmsnorm_weight = tl.load(
+        rmsnorm_weight_ptr + h_offs,
+        mask=h_offs < H,
+        other=0.0,
+    ).to(tl.float32)  # [H_PAD]
+    y = norm_input * tl.rsqrt(tl.sum(norm_input * norm_input, axis=1) / H + rmsnorm_eps)[:, None] * rmsnorm_weight[None, :]
+    tl.store(
+        y_bf16_ptr + t_offs[:, None] * H + h_offs[None, :],
+        y.to(tl.bfloat16),
+        mask=(t_offs[:, None] < T) & (h_offs < H),
+    )
+ 
+
 def mhc_shifted_post_pre_deep_gemm(
     x: torch.Tensor,  # [T,H], BF16
     residual: torch.Tensor,  # [T,hc_mult,H], BF16
@@ -60,20 +281,77 @@ def mhc_shifted_post_pre_deep_gemm(
     logger.debug("GEMS MHC_SHIFTED_POST_PRE_DEEP_GEMM")
 
     T, H = x.shape
+    assert (H > 0) & (H % (64 * 16) == 0) 
     assert x.dtype == torch.bfloat16 and x.is_contiguous()
     assert (T, NUM_ROUTES, H) == residual.shape and residual.dtype == torch.bfloat16 and residual.is_contiguous()
     assert (T, NUM_ROUTES) == shifted_prev_mix.shape and shifted_prev_mix.dtype == torch.float and shifted_prev_mix.is_contiguous()
     assert (T, NUM_ROUTES, 1) == post_mix.shape and post_mix.dtype == torch.float and post_mix.is_contiguous()
     assert (T, NUM_ROUTES, NUM_ROUTES) == comb_res_mix.shape and comb_res_mix.dtype == torch.float and comb_res_mix.is_contiguous()
     assert (NUM_HC_OUTPUTS, NUM_ROUTES*H) == fn.shape and fn.dtype == torch.float and fn.is_contiguous()
-    assert 3 == mix_scales.shape and mix_scales.dtype == torch.float and mix_scales.is_contiguous()
+    assert (3,) == mix_scales.shape and mix_scales.dtype == torch.float and mix_scales.is_contiguous()
     assert NUM_HC_OUTPUTS == mix_bases.shape and mix_bases.dtype == torch.float and mix_bases.is_contiguous()
 
     new_residual = torch.empty_like(residual)
-    new_prev_mix = x.new_empty(num_tokens, hc_mult, 1, dtype=torch.float32)
+    new_prev_mix = x.new_empty(T, hc_mult, 1, dtype=torch.float32)
     new_post_mix = torch.empty_like(post_mix)
     new_comb_res_mix = torch.empty_like(comb_res_mix)
-    y_bf16 = x.new_empty(num_tokens, hidden_size, dtype=torch.bfloat16)
+    y_bf16 = x.new_empty(T, hidden_size, dtype=torch.bfloat16)
+    if T > 0:
+        def grid1(meta):
+            return (cdiv(T, meta["BLOCK_SIZE_T"]), cdiv(T, meta["BLOCK_SIZE_H"]))
+        triton_mhc_shifted_post_pre_kernel[grid1](
+            x,
+            residual,
+            shifted_prev_mix,
+            post_mix,
+            comb_res_mix,
+            fn,
+            mix_scales,
+            mix_bases_base,
+            hc_norm_eps,
+            hc_pre_eps,
+            hc_post_scale,
+            sinkhorn_eps,
+            num_sinkhorn_iters,
+            rmsnorm_weight,
+            rmsnorm_eps,
+            new_residual,
+            new_post_mix,
+            new_comb_res_mix,
+            y_bf16,
+            new_prev_mix,
+            T,
+            T_PAD=triton.next_power_of_2(T),
+            H=H,
+        )
+        def grid2(meta):
+    		return (cdiv(T, meta["BLOCK_SIZE_T"]),))
+        triton_mhc_shifted_post_pre_kernel2(
+            x,
+            residual,
+            shifted_prev_mix,
+            post_mix,
+            comb_res_mix,
+            fn,
+            mix_scales,
+            mix_bases_base,
+            hc_norm_eps,
+            hc_pre_eps,
+            hc_post_scale,
+            sinkhorn_eps,
+            num_sinkhorn_iters,
+            rmsnorm_weight,
+            rmsnorm_eps,
+            new_residual,
+            new_post_mix,
+            new_comb_res_mix,
+            y_bf16,
+            new_prev_mix,
+            T,
+            T_PAD=triton.next_power_of_2(T),
+            H=H,
+            H_PAD=triton.next_power_of_2(H),
+        )
     return (
         new_residual,
         new_post_mix,
