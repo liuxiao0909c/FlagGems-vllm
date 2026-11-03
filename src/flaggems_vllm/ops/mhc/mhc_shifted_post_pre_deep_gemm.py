@@ -77,58 +77,45 @@ def triton_mhc_shifted_post_pre_kernel(
     HC_MULT: tl.constexpr = 4
     
     pid_t, pid_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
-    t_offs = pid_t * BLOCK_SIZE_T + tl.arange(0, BLOCK_SIZE_T)
     h_offs = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
     hc_mult_offs = tl.arange(0, HC_MULT)
     norm_input_ptr = y_bf16_ptr  # both [T, H]
     
     x = tl.load(
-        x_ptr + t_offs[:, None] * H + h_offs[None, :],
-        mask=(t_offs[:, None] < T) & (h_offs[None, :] < H),
+        x_ptr + pid_t * H + h_offs,
+        mask=h_offs < H,
         other=0.0,
-    ).to(tl.float32).expand_dims(1)  # [BLOCK_SIZE_T, 1, BLOCK_SIZE_H]
+    ).to(tl.float32)  # [BLOCK_SIZE_H]
     post_mix = tl.load(
-        post_mix_ptr + t_offs[:, None] * HC_MULT + hc_mult_offs[None, :],
-        mask=t_offs[:, None] < T,
-        other=0.0,
-    )[:, :, None]  # [BLOCK_SIZE_T, HC_MULT, 1]
-    new_residual = x * post_mix  # [BLOCK_SIZE_T, HC_MULT, BLOCK_SIZE_H]
+        post_mix_ptr + pid_t * HC_MULT + hc_mult_offs,
+    )  # [HC_MULT]
+    new_residual = x[None, :] * post_mix[:, None]  # [HC_MULT, BLOCK_SIZE_H]
 
     # 'tij,tih->tjh'
     for i in tl.static_range(0, HC_MULT):
         comb_res_mix = tl.load(
-            comb_res_mix_ptr + t_offs[:, None, None] * HC_MULT * HC_MULT + i * HC_MULT + hc_mult_offs[None, None, :],
-            mask=t_offs[:, None, None] < T,
-            other=0.0,
-        )  # [BLOCK_SIZE_T, 1, HC_MULT]
+            comb_res_mix_ptr + pid_t * HC_MULT * HC_MULT + i * HC_MULT + hc_mult_offs,
+        )  # [HC_MULT]
         residual = tl.load(
-            residual_ptr + t_offs[:, None, None] * HC_MULT * H + i * H + h_offs[None, None, :],
-            mask=(t_offs[:, None, None] < T) & (h_offs[None, None, :] < H),
+            residual_ptr + pid_t * HC_MULT * H + i * H + h_offs,
+            mask=h_offs < H,
             other=0.0,
-        ).to(tl.float32)  # [BLOCK_SIZE_T, 1, BLOCK_SIZE_H]
-        new_residual += comb_res_mix.trans(0, 2, 1) * residual  # [BLOCK_SIZE_T, HC_MULT, BLOCK_SIZE_H]
+        ).to(tl.float32)  # [BLOCK_SIZE_H]
+        new_residual += comb_res_mix[:, None] * residual[None, :]  # [HC_MULT, BLOCK_SIZE_H]
 
     shifted_prev_mix = tl.load(
-        shifted_prev_mix_ptr + t_offs[:, None] * HC_MULT + hc_mult_offs[None, :],
-        mask=t_offs[:, None] < T,
-        other=0.0,
-    )[:, :, None]  # [BLOCK_SIZE_T, HC_MULT, 1]
-    norm_input = tl.sum(new_residual.to(tl.bfloat16).to(tl.float32) * shifted_prev_mix, axis=1).to(tl.bfloat16)  # [BLOCK_SIZE_T, BLOCK_SIZE_H]
+        shifted_prev_mix_ptr + pid_t * HC_MULT + hc_mult_offs,
+    )  # [HC_MULT]
+    norm_input = tl.sum(new_residual.to(tl.bfloat16).to(tl.float32) * shifted_prev_mix[:, None], axis=0).to(tl.bfloat16)  # [BLOCK_SIZE_H]
     tl.store(
-       norm_input_ptr + t_offs[:, None] * H + h_offs[None, :],
+       norm_input_ptr + pid_t * H + h_offs,
        norm_input,
-       mask=(t_offs[:, None] < T) & (h_offs[None, :] < H),
+       mask=h_offs < H,
     )
-    #if pid_t == 0:
-    #    tl.device_print("BLOCK_SIZE_T:", BLOCK_SIZE_T)
-    #    tl.device_print("new_residual:", new_residual.to(tl.bfloat16))
-    #if pid_t == 0 and pid_h == 0:
-    #    tl.device_print("new_residual:", new_residual)
-    #    tl.device_print("new_residual_bf16:", new_residual.to(tl.bfloat16))
     tl.store(
-       new_residual_ptr + t_offs[:, None, None] * HC_MULT * H + hc_mult_offs[None, :, None] * H + h_offs[None, None, :],
+       new_residual_ptr + pid_t * HC_MULT * H + hc_mult_offs[:, None] * H + h_offs[None, :],
        new_residual.to(tl.bfloat16),
-       mask=(t_offs[:, None, None] < T) & (h_offs[None, None, :] < H),
+       mask=h_offs[None, :] < H,
     )
 
 
@@ -195,89 +182,84 @@ def triton_mhc_shifted_post_pre_kernel2(
     norm_input_ptr = y_bf16_ptr  # both [T, H]
 
     pid_t = tl.program_id(0).to(tl.int64)
-    t_offs = pid_t * BLOCK_SIZE_T + tl.arange(0, BLOCK_SIZE_T)
     fn0_offs = tl.arange(0, HC_MULT)
     fn1_offs = fn0_offs
     fn2_offs = tl.arange(0, HC_MULT * HC_MULT)
 
-    mixed0 = tl.zeros([BLOCK_SIZE_T, HC_MULT], dtype=tl.float32)
-    mixed1 = tl.zeros([BLOCK_SIZE_T, HC_MULT], dtype=tl.float32)
-    mixed2 = tl.zeros([BLOCK_SIZE_T, HC_MULT * HC_MULT], dtype=tl.float32)
+    mixed0 = tl.zeros([HC_MULT], dtype=tl.float32)
+    mixed1 = tl.zeros([HC_MULT], dtype=tl.float32)
+    mixed2 = tl.zeros([HC_MULT * HC_MULT], dtype=tl.float32)
     cnt = (HC_MULT * H + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-    hc_sqr_sum = tl.zeros([BLOCK_SIZE_T], dtype=tl.float32)
+    hc_sqr_sum = tl.zeros([1], dtype=tl.float32)
     for split_k in tl.range(0, cnt):
         k_offs = BLOCK_SIZE_K * split_k + tl.arange(0, BLOCK_SIZE_K)
         new_residual = tl.load(
-            new_residual_ptr + t_offs[:, None] * K + k_offs[None, :],
-            mask=(t_offs[:, None] < T) & (k_offs[None, :] < K),
+            new_residual_ptr + pid_t * K + k_offs,
+            mask=k_offs < K,
             other=0.0,
-        ).to(tl.float32)  # [BLOCK_SIZE_T, BLOCK_SIZE_K]
-        hc_sqr_sum += tl.sum(new_residual * new_residual, axis=1)  # [BLOCK_SIZE_T]
+        ).to(tl.float32)  # [BLOCK_SIZE_K]
+        hc_sqr_sum += tl.sum(new_residual * new_residual, axis=0)  # [1]
 
         fn0 = tl.load(
             fn_ptr + fn0_offs[:, None] * K + k_offs[None, :],
             mask=k_offs[None, :] < K,
             other=0.0,
         )  # [HC_MULT, BLOCK_SIZE_K]
-        mixed0 = tl.dot(new_residual, tl.trans(fn0), acc=mixed0, input_precision="ieee")  # [BLOCK_SIZE_T, HC_MULT]
-        #mixed0 = tl.dot(new_residual, tl.trans(fn0), acc=mixed0)  # [BLOCK_SIZE_T, HC_MULT]
+        mixed0 += tl.sum(new_residual[None, :] * fn0, axis=1)
 
         fn1 = tl.load(
             fn_ptr + (HC_MULT + fn1_offs[:, None]) * K + k_offs[None, :],
             mask=k_offs[None, :] < K,
             other=0.0,
         )  # [HC_MULT, BLOCK_SIZE_K]
-        mixed1 = tl.dot(new_residual, tl.trans(fn1), acc=mixed1, input_precision="ieee")  # [BLOCK_SIZE_T, HC_MULT]
-        #mixed1 = tl.dot(new_residual, tl.trans(fn1), acc=mixed1)  # [BLOCK_SIZE_T, HC_MULT]
+        mixed1 += tl.sum(new_residual[None, :] * fn1, axis=1)
 
         fn2 = tl.load(
             fn_ptr + (HC_MULT * 2 + fn2_offs[:, None]) * K + k_offs[None, :],
             mask=k_offs[None, :] < K,
             other=0.0,
         )  # [HC_MULT * HC_MULT, BLOCK_SIZE_K]
-        mixed2 = tl.dot(new_residual, tl.trans(fn2), acc=mixed2, input_precision="ieee")  # [BLOCK_SIZE_T, HC_MULT * HC_MULT]
-        #mixed2 = tl.dot(new_residual, tl.trans(fn2), acc=mixed2)  # [BLOCK_SIZE_T, HC_MULT * HC_MULT]
+        mixed2 += tl.sum(new_residual[None, :] * fn2, axis=1)
 
     rsqrt = tl.rsqrt(hc_sqr_sum / (HC_MULT * H) + hc_norm_eps)
-    mixed0 *= rsqrt[:, None]
-    mixed1 *= rsqrt[:, None]
-    mixed2 *= rsqrt[:, None]
+    mixed0 *= rsqrt
+    mixed1 *= rsqrt
+    mixed2 *= rsqrt
     mix_scale0 = tl.load(mix_scales_ptr)
     mix_base0 = tl.load(mix_bases_ptr + fn0_offs)  # [HC_MULT]
-    mixed0 = mixed0 * mix_scale0 + mix_base0[None, :]  # [BLOCK_SIZE_T, HC_MULT]
+    mixed0 = mixed0 * mix_scale0 + mix_base0  # [HC_MULT]
     mix_scale1 = tl.load(mix_scales_ptr + 1)
     mix_base1 = tl.load(mix_bases_ptr + HC_MULT + fn1_offs)  # [HC_MULT]
-    mixed1 = mixed1 * mix_scale1 + mix_base1[None, :]  # [BLOCK_SIZE_T, HC_MULT]
+    mixed1 = mixed1 * mix_scale1 + mix_base1  # [HC_MULT]
     mix_scale2 = tl.load(mix_scales_ptr + 2)
     mix_base2 = tl.load(mix_bases_ptr + HC_MULT * 2 + fn2_offs)  # [HC_MULT * HC_MULT]
-    mixed2 = mixed2 * mix_scale2 + mix_base2[None, :]  # [BLOCK_SIZE_T, HC_MULT * HC_MULT]
+    mixed2 = mixed2 * mix_scale2 + mix_base2  # [HC_MULT * HC_MULT]
      
-    new_prev_mix = tl.sigmoid(mixed0) + hc_pre_eps  # [BLOCK_SIZE_T, HC_MULT]
-    tl.store(new_prev_mix_ptr + t_offs[:, None] * HC_MULT + fn0_offs[None, :], new_prev_mix, mask=t_offs[:, None] < T)
-    new_post_mix = tl.sigmoid(mixed1) * hc_post_scale  # [BLOCK_SIZE_T, HC_MULT]
-    tl.store(new_post_mix_ptr + t_offs[:, None] * HC_MULT + fn1_offs[None, :], new_post_mix, mask=t_offs[:, None] < T)
-    new_comb_res_mix = _sinkhorn_reference(mixed2.reshape(BLOCK_SIZE_T, HC_MULT, HC_MULT), num_sinkhorn_iters, sinkhorn_eps)  # [BLOCK_SIZE_T, HC_MULT, HC_MULT]
+    new_prev_mix = tl.sigmoid(mixed0) + hc_pre_eps  # [HC_MULT]
+    tl.store(new_prev_mix_ptr + pid_t * HC_MULT + fn0_offs, new_prev_mix)
+    new_post_mix = tl.sigmoid(mixed1) * hc_post_scale  # [HC_MULT]
+    tl.store(new_post_mix_ptr + pid_t * HC_MULT + fn1_offs, new_post_mix)
+    new_comb_res_mix = _sinkhorn_reference(mixed2.reshape(HC_MULT, HC_MULT), num_sinkhorn_iters, sinkhorn_eps)  # [HC_MULT, HC_MULT]
     tl.store(
-        new_comb_res_mix_ptr + t_offs[:, None] * HC_MULT * HC_MULT + fn2_offs[None, :],
-        new_comb_res_mix.reshape(BLOCK_SIZE_T, HC_MULT * HC_MULT),
-        mask=t_offs[:, None] < T,
+        new_comb_res_mix_ptr + pid_t * HC_MULT * HC_MULT + fn2_offs,
+        new_comb_res_mix.reshape(HC_MULT * HC_MULT),
     )
     h_offs = tl.arange(0, H_PAD)
     norm_input = tl.load(
-        norm_input_ptr + t_offs[:, None] * H + h_offs[None, :],
-        mask=(t_offs[:, None] < T) & (h_offs < H),
+        norm_input_ptr +pid_t * H + h_offs,
+        mask=h_offs < H,
         other=0.0,
-    ).to(tl.float32)  # [BLOCK_SIZE_T, H_PAD]
+    ).to(tl.float32)  # [H_PAD]
     rmsnorm_weight = tl.load(
         rmsnorm_weight_ptr + h_offs,
         mask=h_offs < H,
         other=0.0,
     ).to(tl.float32)  # [H_PAD]
-    y = norm_input * tl.rsqrt(tl.sum(norm_input * norm_input, axis=1) / H + rmsnorm_eps)[:, None] * rmsnorm_weight[None, :]
+    y = norm_input * tl.rsqrt(tl.sum(norm_input * norm_input, axis=0) / H + rmsnorm_eps) * rmsnorm_weight
     tl.store(
-        y_bf16_ptr + t_offs[:, None] * H + h_offs[None, :],
+        y_bf16_ptr + pid_t * H + h_offs,
         y.to(tl.bfloat16),
-        mask=(t_offs[:, None] < T) & (h_offs < H),
+        mask=h_offs < H,
     )
  
 
