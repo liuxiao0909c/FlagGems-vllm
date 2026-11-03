@@ -261,7 +261,51 @@ def triton_mhc_shifted_post_pre_kernel2(
         y.to(tl.bfloat16),
         mask=h_offs < H,
     )
- 
+
+
+
+@triton.jit
+def triton_hc_prenorm_gemm_kernel(
+    new_residual_ptr,  # [T, hc_mult, H]
+    fn_ptr,  # [hc_mult*(hc_mult + 2), hc_mult * H]
+    out_ptr,  # [T, hc_mult*(hc_mult + 2)]
+    hc_sqr_sum_ptr,  # [T]
+    T,
+    T_PAD: tl.constexpr,
+    H: tl.constexpr,
+    H_PAD: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_OUT: tl.constexpr,
+):
+    HC_MULT: tl.constexpr = 4
+    K: tl.constexpr = HC_MULT * H
+    pid_t, pid_out = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    t_offs = pid_t * BLOCK_SIZE_T + tl.arange(0, BLOCK_SIZE_T)
+    out_offs = pid_out * BLOCK_SIZE_OUT + tl.arange(0, BLOCK_SIZE_OUT)
+
+    cnt = (K + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    out
+    for _ int range(cnt):
+        new_residual = tl.load(
+            new_residual_ptr + t_offs[:, None] * K + k_offs[None, :],
+            mask=(t_offs[:, None] < T) & (k_offs[None, :] < K),
+            other=0.0,
+        ).to(tl.float32)  # [BLOCK_SIZE_T, BLOCK_SIZE_K]
+        fn = tl.load(
+            fn_ptr + out_offs[:, None] * K + k_offs[None, :],
+            mask=k_offs[None, :] < K,
+            other=0.0,
+        )  # [BLOCK_SIZE_OUT, BLOCK_SIZE_K]
+
+
+        fn = tl.load(
+
+        )
+
+    return
+
+
 
 def mhc_shifted_post_pre_deep_gemm(
     x: torch.Tensor,  # [T,H], BF16
@@ -370,7 +414,7 @@ def mhc_shifted_post_pre_deep_gemm(
             H=H,
             H_PAD=triton.next_power_of_2(H),
             BLOCK_SIZE_T=1,
-            BLOCK_SIZE_K=1024,
+            BLOCK_SIZE_K=512,
             num_warps=4,
             num_stages=2,
         )
