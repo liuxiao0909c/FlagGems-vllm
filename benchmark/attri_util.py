@@ -284,7 +284,8 @@ class BenchmarkResult:
         if metrics.gbps is not None:
             data_line += f"{torch_gbps_str:>20}{gems_gbps_str:>20}"
         data_line += " " * 10
-        data_line += f"{shape_detail_str}\n"
+        #data_line += f"{shape_detail_str}\n"
+        data_line += "\n"
         return data_line
 
     def gen_legacy_shape(self, metrics: BenchmarkMetrics) -> Optional[int]:
