@@ -283,7 +283,7 @@ def triton_hc_prenorm_gemm_kernel(
             mask=(out_offs[:, None] < OUT_DIM) & (k_offs[None, :] < K),
             other=0.0,
         )  # [BLOCK_SIZE_OUT, BLOCK_SIZE_K]
-        acc = tl.dot(new_residual, tl.trans(fn), acc=acc, allow_tf32=False)
+        acc = tl.dot(new_residual, tl.trans(fn), acc=acc, allow_tf32=True)
         sqr_sum += tl.sum(new_residual * new_residual, axis=1)
         k_offs += BLOCK_SIZE_K
     
