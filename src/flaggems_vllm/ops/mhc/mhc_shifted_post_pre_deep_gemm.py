@@ -171,6 +171,8 @@ def triton_mhc_shifted_post_pre_kernel2(
     new_comb_res_mix_ptr,
     y_bf16_ptr,
     new_prev_mix_ptr,
+    gemm_out_ptr,
+    hc_sqr_sum_ptr,
     T,
     T_PAD: tl.constexpr,
     H: tl.constexpr,
@@ -181,6 +183,7 @@ def triton_mhc_shifted_post_pre_kernel2(
     return
     HC_MULT: tl.constexpr = 4
     K: tl.constexpr = HC_MULT * H
+    OUT_DIM: tl.constexpr = HC_MULT * (HC_MULT + 2)
     norm_input_ptr = y_bf16_ptr  # both [T, H]
 
     pid_t = tl.program_id(0).to(tl.int64)
@@ -192,36 +195,17 @@ def triton_mhc_shifted_post_pre_kernel2(
     mixed1 = tl.zeros([HC_MULT], dtype=tl.float32)
     mixed2 = tl.zeros([HC_MULT * HC_MULT], dtype=tl.float32)
     cnt = (HC_MULT * H + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-    hc_sqr_sum = tl.zeros([1], dtype=tl.float32)
-    for split_k in tl.range(0, cnt):
-        k_offs = BLOCK_SIZE_K * split_k + tl.arange(0, BLOCK_SIZE_K)
-        new_residual = tl.load(
-            new_residual_ptr + pid_t * K + k_offs,
-            mask=k_offs < K,
-            other=0.0,
-        ).to(tl.float32)  # [BLOCK_SIZE_K]
-        hc_sqr_sum += tl.sum(new_residual * new_residual, axis=0)  # [1]
+    hc_sqr_sum = tl.load(hc_sqr_sum_ptr + pid_t)
 
-        fn0 = tl.load(
-            fn_ptr + fn0_offs[:, None] * K + k_offs[None, :],
-            mask=k_offs[None, :] < K,
-            other=0.0,
-        )  # [HC_MULT, BLOCK_SIZE_K]
-        mixed0 += tl.sum(new_residual[None, :] * fn0, axis=1)
-
-        fn1 = tl.load(
-            fn_ptr + (HC_MULT + fn1_offs[:, None]) * K + k_offs[None, :],
-            mask=k_offs[None, :] < K,
-            other=0.0,
-        )  # [HC_MULT, BLOCK_SIZE_K]
-        mixed1 += tl.sum(new_residual[None, :] * fn1, axis=1)
-
-        fn2 = tl.load(
-            fn_ptr + (HC_MULT * 2 + fn2_offs[:, None]) * K + k_offs[None, :],
-            mask=k_offs[None, :] < K,
-            other=0.0,
-        )  # [HC_MULT * HC_MULT, BLOCK_SIZE_K]
-        mixed2 += tl.sum(new_residual[None, :] * fn2, axis=1)
+    mixed0 = tl.load(
+        gemm_out_ptr + pid_t * OUT_DIM + fn0_offs
+    )
+    mixed1 = tl.load(
+        gemm_out_ptr + pid_t * OUT_DIM + HC_MULT + fn1_offs
+    )
+    mixed2 = tl.load(
+        gemm_out_ptr + pid_t * OUT_DIM + HC_MULT * 2 + fn2_offs
+    )
 
     rsqrt = tl.rsqrt(hc_sqr_sum / (HC_MULT * H) + hc_norm_eps)
     mixed0 *= rsqrt
@@ -265,17 +249,6 @@ def triton_mhc_shifted_post_pre_kernel2(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE_T": bt, "BLOCK_SIZE_K": bk, "BLOCK_SIZE_OUT": bo}, num_warps=nw, num_stages=ns)
-        for bt in BT_LIST_AUTOTUNE
-        for bk in BK_LIST_AUTOTUNE
-        for bo in [32, 16, 8]
-        for nw in NUM_WARPS_AUTOTUNE
-        for ns in [1, 2, 3]
-    ],
-    key=["H"],
-)
 @triton.jit
 def triton_hc_prenorm_gemm_kernel(
     new_residual_ptr,  # [T, hc_mult, H]
@@ -312,7 +285,7 @@ def triton_hc_prenorm_gemm_kernel(
             mask=(out_offs[:, None] < OUT_DIM) & (k_offs[None, :] < K),
             other=0.0,
         )  # [BLOCK_SIZE_OUT, BLOCK_SIZE_K]
-        acc += tl.dot(new_residual, tl.trans(fn))
+        acc = tl.dot(new_residual, tl.trans(fn), acc=acc, allow_tf32=False)
         sqr_sum += tl.sum(new_residual * new_residual, axis=1)
         k_offs += BLOCK_SIZE_K
     
@@ -406,10 +379,24 @@ def mhc_shifted_post_pre_deep_gemm(
             num_warps=4,
             num_stages=1,
         )
+        #device=x.device
         gemm_out = x.new_empty([T, NUM_HC_OUTPUTS], dtype=torch.float32)
         hc_sqr_sum = x.new_empty([T], dtype=torch.float32)
-        def grid2(meta):
-            return (triton.cdiv(T, meta["BLOCK_SIZE_T"]), triton.cdiv(NUM_HC_OUTPUTS, meta["BLOCK_SIZE_OUT"]))
+        #x_flat = new_residual.reshape(T, 4*H)
+        #from flaggems_vllm.ops.data_movement import contiguous_copy
+        #fn_bf16 = contiguous_copy(fn, torch.bfloat16)
+        ## BF16 split-K output atomics round every partial sum. Accumulate once in
+        ## FP32 through the public BMM API, then retain the original BF16 boundary.
+        #import flag_gems
+        #bmm_out = getattr(flag_gems, "bmm_out", None)
+        #if not callable(bmm_out):
+        #    raise NotImplementedError("MHC projection requires public FlagGems bmm_out")
+        #bmm_out(x_flat.unsqueeze(0), fn_bf16.t().unsqueeze(0), gemm_out.unsqueeze(0))
+
+        #hc_sqr_sum = new_residual.float().square().sum((1, 2))
+        #def grid2(meta):
+        #    return (triton.cdiv(T, meta["BLOCK_SIZE_T"]), triton.cdiv(NUM_HC_OUTPUTS, meta["BLOCK_SIZE_OUT"]))
+        grid2 = (triton.cdiv(T, 1), triton.cdiv(NUM_HC_OUTPUTS, 1))
         triton_hc_prenorm_gemm_kernel[grid2](
             new_residual,
             fn,
@@ -417,6 +404,11 @@ def mhc_shifted_post_pre_deep_gemm(
             hc_sqr_sum,
             T,
             H=H,
+            BLOCK_SIZE_T=1,
+            BLOCK_SIZE_K=1024,
+            BLOCK_SIZE_OUT=1,
+            num_warps=4,
+            num_stages=1,
         )
         #def grid3(meta):
         #    return (triton.cdiv(T, meta["BLOCK_SIZE_T"]),)
@@ -442,6 +434,8 @@ def mhc_shifted_post_pre_deep_gemm(
             new_comb_res_mix,
             y_bf16,
             new_prev_mix,
+            gemm_out,
+            hc_sqr_sum,
             T,
             T_PAD=triton.next_power_of_2(T),
             H=H,
