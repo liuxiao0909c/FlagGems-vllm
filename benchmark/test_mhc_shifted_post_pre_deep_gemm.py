@@ -198,7 +198,7 @@ class MhcShiftedPostPreDeepGEMMBenchmark(base.Benchmark):
             for num_tokens in [1, 17, 65, 200, 1025, 4096, 32768]
             for hidden_size in [4096, 5120, 7168]
         ]
-        self.shapes = [(32768, 7168)]
+        #self.shapes = [(32768, 7168)]
 
     def get_input_iter(self, cur_dtype):
         for config in self.shapes:

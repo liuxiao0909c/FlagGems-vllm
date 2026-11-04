@@ -74,7 +74,6 @@ def triton_mhc_shifted_post_pre_kernel(
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
 ):
-    return
     HC_MULT: tl.constexpr = 4
     
     pid_t, pid_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
@@ -180,7 +179,6 @@ def triton_mhc_shifted_post_pre_kernel2(
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    return
     HC_MULT: tl.constexpr = 4
     K: tl.constexpr = HC_MULT * H
     OUT_DIM: tl.constexpr = HC_MULT * (HC_MULT + 2)
@@ -396,7 +394,7 @@ def mhc_shifted_post_pre_deep_gemm(
         #hc_sqr_sum = new_residual.float().square().sum((1, 2))
         #def grid2(meta):
         #    return (triton.cdiv(T, meta["BLOCK_SIZE_T"]), triton.cdiv(NUM_HC_OUTPUTS, meta["BLOCK_SIZE_OUT"]))
-        grid2 = (triton.cdiv(T, 1), triton.cdiv(NUM_HC_OUTPUTS, 1))
+        grid2 = (triton.cdiv(T, 64), triton.cdiv(NUM_HC_OUTPUTS, 32))
         triton_hc_prenorm_gemm_kernel[grid2](
             new_residual,
             fn,
@@ -404,11 +402,11 @@ def mhc_shifted_post_pre_deep_gemm(
             hc_sqr_sum,
             T,
             H=H,
-            BLOCK_SIZE_T=1,
-            BLOCK_SIZE_K=1024,
-            BLOCK_SIZE_OUT=1,
+            BLOCK_SIZE_T=64,
+            BLOCK_SIZE_K=32,
+            BLOCK_SIZE_OUT=32,
             num_warps=4,
-            num_stages=1,
+            num_stages=3,
         )
         #def grid3(meta):
         #    return (triton.cdiv(T, meta["BLOCK_SIZE_T"]),)
