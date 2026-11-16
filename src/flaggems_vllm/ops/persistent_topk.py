@@ -2512,6 +2512,473 @@ def _per_row_cta_topk_wrapper(
     )
 
 
+@triton.jit
+def _extract_coarse_bin_N(x, BITS: tl.constexpr):
+    h = x.to(tl.float16)
+    bits = h.to(tl.uint16, bitcast=True)
+    key = tl.where((bits & 0x8000) != 0, ~bits, bits | 0x8000)
+    return (key >> (16 - BITS)).to(tl.uint32)
+
+
+@triton.jit
+def _histogram_vecs(
+    vecs0,
+    s_histogram_ptr,
+    mask,
+    HIST_BITS: tl.constexpr,
+)
+    bins = _extract_coarse_bin_N(vecs0, HIST_BITS)
+    tl.atomic_add(
+        s_histogram_ptr + bins,
+        1,
+        mask=mask,
+        sem="relaxed",
+        scope="cta",
+    )
+
+
+@triton.jit
+def _process_vecs(
+    vecs0,
+    row_offs,
+    out_ptr,
+    s_counter_gt_ptr,
+    s_counter_eq_ptr,
+    s_tie_idx_ptr,
+    s_tie_score_ptr,
+    thr_bin,
+    num_above,
+    need_tie,
+    HIST_BITS: tl.constexpr,
+    TOPK: tl.constexpr,
+)
+    bins = _extract_coarse_bin_N(vecs0, HIST_BITS)
+    gt_pos = tl.atomic_add(
+        s_counter_gt_ptr,
+        1,
+        mask=bins > thr_bin,
+        sem="relaxed",
+        scope="cta",
+    )
+    tl.store(
+        out_ptr + gt_pos,
+        row_offs,
+        mask=bins > thr_bin,
+    )
+    eq_pos = tl.atomic_add(
+        s_counter_eq_ptr,
+        1,
+        mask=bins == thr_bin,
+        sem="relaxed",
+        scope="cta",
+    )
+    if not need_tie:
+        tl.store(
+            out_ptr + num_above + eq_pos,
+            row_offs,
+            mask=(bins == thr_bin) & ((num_above + eq_pos) < TOPK),
+        )
+    else:
+        tl.store(
+            s_tie_idx_ptr + eq_pos,
+            row_offs,
+            mask=(bins == thr_bin) & (eq_pos < TOPK),
+        )
+        tl.store(
+            s_tie_score_ptr + eq_pos,
+            vecs0,
+            mask=(bins == thr_bin) & (eq_pos < TOPK),
+        )
+
+
+@triton.jit
+def _filtered_topk_kernel(
+    logits,
+    output,
+    seq_lens,
+    num_rows,
+    TOPK: tl.constexpr,
+    stride,
+):
+    BLOCK_SIZE: tl.constexpr = 1024
+    HIST_BITS: tl.constexpr = 12
+    VECS: tl.constexpr = 4
+    VECS_PER_THREAD: tl.constexpr = 8
+    ELEMS_PER_THREAD: tl.constexpr = VECS_PER_THREAD * VECS  # 32
+    HIST_BINS: tl.constexpr = 1 << HIST_BITS  # 4096
+    ITEMS_PER_THREAD: tl.constexpr = HIST_BINS // BLOCK_SIZE  # 4
+    WARP_SIZE: tl.constexpr = 32
+    NUM_WARPS: tl.constexpr = BLOCK_SIZE // WARP_SIZE  # 32
+    MAX_TIES: tl.constexpr = 1024
+    TIE_CAPACITY: tl.constexpr = tl.maximum(TOPK, MAX_TIES)
+    BUFFER_SIZE: tl.constexpr = tl.maximum(HIST_BINS, TIE_CAPACITY)
+
+    row_id = tl.program_id(0).to(tl.int64)
+    row_ptr = logits + row_id * stride
+    out_ptr = output + row_id * TOPK
+    length = tl.load(seq_lens + row_id)  # <= 32768
+    # smem
+    s_match_bin = tle.gpu.alloc(
+        [4],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_bin_ptr = tle.gpu.local_ptr(s_match_bin, (0,))
+    s_above_count_ptr = tle.gpu.local_ptr(s_match_bin, (1,))
+    s_equal_count_ptr = tle.gpu.local_ptr(s_match_bin, (2,))
+    s_counter_gt = tle.gpu.alloc(
+        [1],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_counter_gt_ptr = tle.gpu.local_ptr(s_counter_gt, (0,))
+    s_counter_eq = tle.gpu.alloc(
+        [1],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_counter_eq_ptr = tle.gpu.local_ptr(s_counter_eq, (0,))
+    s_warp_sum = tle.gpu.alloc(
+        [NUM_WARPS],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_warp_sum_ptr = tle.gpu.local_ptr(s_warp_sum, (0,))
+    s_buffer = tle.gpu.alloc(
+        [BUFFER_SIZE],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_histogram_ptr = tle.gpu.local_ptr(s_buffer, (0,))
+    s_tie_idx_ptr = s_histogram_ptr
+    s_tie_score = tle.gpu.alloc(
+        [TIE_CAPACITY],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_tie_score_ptr = tle.gpu.local_ptr(s_tie_score, (0,))
+    
+    # Phase 1: Load all data into RF + build histogram
+    # Zero the histogram (SMEM writes)
+    tl.store(s_histogram_ptr + tl.arange(0, HIST_BINS), 0)
+    tl.store(s_counter_gt_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=offs == 0)
+    tl.store(s_counter_eq_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=offs == 0)
+    row_offs = tl.arange(0, BLOCK_SIZE * ELEMS_PER_THREAD)
+    # length <= BLOCK_SIZE * ELEMS_PER_THREAD, which is 32768
+    VECS_PER_THREAD
+    row_offs = tl.arange(0, BLOCK_SIZE * VECS)
+    vecs0 = tl.load(row_ptr + row_offs, mask=row_offs < length, other=0)
+    vecs1 = tl.load(
+        row_ptr + row_offs + BLOCK_SIZE * VECS,
+        mask=(row_offs + BLOCK_SIZE * VECS) < length,
+        other=0,
+    )
+    vecs2 = tl.load(
+        row_ptr + row_offs + BLOCK_SIZE * VECS * 2,
+        mask=(row_offs + BLOCK_SIZE * VECS * 2) < length,
+        other=0,
+    )
+    vecs3 = tl.load(
+        row_ptr + row_offs + BLOCK_SIZE * VECS * 3,
+        mask=(row_offs + BLOCK_SIZE * VECS * 3) < length,
+        other=0,
+    )
+    vecs4 = tl.load(
+        row_ptr + row_offs + BLOCK_SIZE * VECS * 4,
+        mask=(row_offs + BLOCK_SIZE * VECS * 4) < length,
+        other=0,
+    )
+    vecs5 = tl.load(
+        row_ptr + row_offs + BLOCK_SIZE * VECS * 5,
+        mask=(row_offs + BLOCK_SIZE * VECS * 5) < length,
+        other=0,
+    )
+    vecs6 = tl.load(
+        row_ptr + row_offs + BLOCK_SIZE * VECS * 6,
+        mask=(row_offs + BLOCK_SIZE * VECS * 6) < length,
+        other=0,
+    )
+    vecs7 = tl.load(
+        row_ptr + row_offs + BLOCK_SIZE * VECS * 7,
+        mask=(row_offs + BLOCK_SIZE * VECS * 7) < length,
+        other=0,
+    )
+    tl.debug_barrier()
+    # Build histogram from RF via atomic adds into the shared histogram
+    _histogram_vecs(
+        vecs0,
+        s_histogram_ptr,
+        row_offs < length,
+        HIST_BITS,
+    )
+    _histogram_vecs(
+        vecs1,
+        s_histogram_ptr,
+        (row_offs + BLOCK_SIZE * VECS) < length,
+        HIST_BITS,
+    )
+    _histogram_vecs(
+        vecs2,
+        s_histogram_ptr,
+        (row_offs + BLOCK_SIZE * VECS * 2) < length,
+        HIST_BITS,
+    )
+    _histogram_vecs(
+        vecs3,
+        s_histogram_ptr,
+        (row_offs + BLOCK_SIZE * VECS * 3) < length,
+        HIST_BITS,
+    )
+    _histogram_vecs(
+        vecs4,
+        s_histogram_ptr,
+        (row_offs + BLOCK_SIZE * VECS * 4) < length,
+        HIST_BITS,
+    )
+    _histogram_vecs(
+        vecs5,
+        s_histogram_ptr,
+        (row_offs + BLOCK_SIZE * VECS * 5) < length,
+        HIST_BITS,
+    )
+    _histogram_vecs(
+        vecs6,
+        s_histogram_ptr,
+        (row_offs + BLOCK_SIZE * VECS * 6) < length,
+        HIST_BITS,
+    )
+    _histogram_vecs(
+        vecs7,
+        s_histogram_ptr,
+        (row_offs + BLOCK_SIZE * VECS * 7) < length,
+        HIST_BITS,
+    )
+    tl.debug_barrier()
+
+    # Phase 2: Prefix scan to find threshold bin
+    # Multi-element scan (4096 bins: 4 per thread)
+    # Step 1: Each thread sums its 4 bins
+    orig0 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE))
+    orig1 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE)
+    orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * 2)
+    orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * 3)
+    local_sum = orig0 + orig1 + orig2 + orig3
+    # Step 2: Warp-level inclusive prefix sum on local_sum
+    warp_inc = tl.sum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1)
+    tl.store(s_warp_sum_ptr + tl.arange(0, NUM_WARPS), warp_inc)
+    tl.debug_barrier()
+    # Step 3: Inter-warp prefix across warp sums.
+    tmp = tl.load(
+        s_warp_sum_ptr + tl.arange(0, NUM_WARPS)[None, :],
+        mask=tl.arange(0, WARP_SIZE)[:, None] < tl.arange(0, NUM_WARPS)[None, :],
+        other=0,
+    )
+    prefix = tl.reduce_sum(tmp, axis=-1)
+    prefix = prefix[None, :] + warp_inc[:, None] - local_sum.reshape(NUM_WARPS, WARP_SIZE)
+    # Step 4: Find threshold - scan 4 bins, accumulate prefix
+    prefix += orig0
+    above = length - prefix
+    mask = (above < TOPK) & (above + orig0 >= TOPK)
+    tl.store(s_bin_ptr, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_above_count_ptr, above, mask)
+    tl.store(s_equal_count_ptr, orig0, mask)
+    prefix += orig1
+    above = length - prefix
+    mask = (above < TOPK) & (above + orig1 >= TOPK)
+    tl.store(s_bin_ptr, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_above_count_ptr, above, mask)
+    tl.store(s_equal_count_ptr, orig1, mask)
+    prefix += orig2
+    above = length - prefix
+    mask = (above < TOPK) & (above + orig2 >= TOPK)
+    tl.store(s_bin_ptr, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_above_count_ptr, above, mask)
+    tl.store(s_equal_count_ptr, orig2, mask)
+    prefix += orig3
+    above = length - prefix
+    mask = (above < TOPK) & (above + orig3 >= TOPK)
+    tl.store(s_bin_ptr, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_above_count_ptr, above, mask)
+    tl.store(s_equal_count_ptr, orig3, mask)
+    tl.debug_barrier()
+
+    # Phase 3: Scatter from registers
+    thr_bin = tl.load(s_bin_ptr)
+    num_above = tl.load(s_above_count_ptr)
+    num_equal = tl.load(s_equal_count_ptr)
+    need_tie = (num_equal + num_above > TOPK)
+    _process_vecs(
+        vecs0,
+        row_offs,
+        out_ptr,
+        s_counter_gt_ptr,
+        s_counter_eq_ptr,
+        s_tie_idx_ptr,
+        s_tie_score_ptr,
+        thr_bin,
+        num_above,
+        need_tie,
+        HIST_BITS,
+        TOPK,
+    )
+    _process_vecs(
+        vecs1,
+        row_offs + BLOCK_SIZE * VECS,
+        out_ptr,
+        s_counter_gt_ptr,
+        s_counter_eq_ptr,
+        s_tie_idx_ptr,
+        s_tie_score_ptr,
+        thr_bin,
+        num_above,
+        need_tie,
+        HIST_BITS,
+        TOPK,
+    )
+    _process_vecs(
+        vecs2,
+        row_offs + BLOCK_SIZE * VECS * 2,
+        out_ptr,
+        s_counter_gt_ptr,
+        s_counter_eq_ptr,
+        s_tie_idx_ptr,
+        s_tie_score_ptr,
+        thr_bin,
+        num_above,
+        need_tie,
+        HIST_BITS,
+        TOPK,
+    )
+    _process_vecs(
+        vecs3,
+        row_offs + BLOCK_SIZE * VECS * 3,
+        out_ptr,
+        s_counter_gt_ptr,
+        s_counter_eq_ptr,
+        s_tie_idx_ptr,
+        s_tie_score_ptr,
+        thr_bin,
+        num_above,
+        need_tie,
+        HIST_BITS,
+        TOPK,
+    )
+    _process_vecs(
+        vecs4,
+        row_offs + BLOCK_SIZE * VECS * 4,
+        out_ptr,
+        s_counter_gt_ptr,
+        s_counter_eq_ptr,
+        s_tie_idx_ptr,
+        s_tie_score_ptr,
+        thr_bin,
+        num_above,
+        need_tie,
+        HIST_BITS,
+        TOPK,
+    )
+    _process_vecs(
+        vecs5,
+        row_offs + BLOCK_SIZE * VECS * 5,
+        out_ptr,
+        s_counter_gt_ptr,
+        s_counter_eq_ptr,
+        s_tie_idx_ptr,
+        s_tie_score_ptr,
+        thr_bin,
+        num_above,
+        need_tie,
+        HIST_BITS,
+        TOPK,
+    )
+    _process_vecs(
+        vecs6,
+        row_offs + BLOCK_SIZE * VECS * 6,
+        out_ptr,
+        s_counter_gt_ptr,
+        s_counter_eq_ptr,
+        s_tie_idx_ptr,
+        s_tie_score_ptr,
+        thr_bin,
+        num_above,
+        need_tie,
+        HIST_BITS,
+        TOPK,
+    )
+    _process_vecs(
+        vecs7,
+        row_offs + BLOCK_SIZE * VECS * 7,
+        out_ptr,
+        s_counter_gt_ptr,
+        s_counter_eq_ptr,
+        s_tie_idx_ptr,
+        s_tie_score_ptr,
+        thr_bin,
+        num_above,
+        need_tie,
+        HIST_BITS,
+        TOPK,
+    )
+
+    # Phase 4: Tie-breaking
+    if (!need_tie) return
+    tl.debug_barrier()
+    num_ties = tl.minimum(num_equal, TOPK)
+    topk_remain = TOPK - num_above
+    if num_ties <= WARP_SIZE:
+        # <=32 ties - Use warp ballot
+        # All-to-all comparison in one __ballot_sync. 32 ties x 32 warps = 1024
+        # comparisons in one instruction per warp. O(1) work.
+        tie_id = tl.load(
+            s_tie_idx_ptr + tl.arange(0, WARP_SIZE),
+            mask=tl.arange(0, WARP_SIZE) < num_ties,
+            other=0,
+        )
+        tie_score = tl.load(
+            s_tie_score_ptr + tl.arange(0, WARP_SIZE),
+            mask=tl.arange(0, WARP_SIZE) < num_ties,
+            other=0,
+        )
+        target_id = tl.load(
+            s_tie_idx_ptr + tl.arange(0, NUM_WARPS),
+            mask=tl.arange(0, NUM_WARPS) < num_ties,
+            other=BLOCK_SIZE * ELEMS_PER_THREAD,
+        )
+        target_score = tl.load(
+            s_tie_score_ptr + tl.arange(0, NUM_WARPS),
+            mask=tl.arange(0, NUM_WARPS) < num_ties,
+            other=float("inf"),
+        )
+        pred = (tie_score[:, None] > target_score[None, :]) | (
+                ((tie_score[:, None] == target_score[None, :]) & (
+                    tie_id[:, None] < target_id[None, :]))
+        tl.inline_asm_elementwise(
+            "{.reg .pred p; setp.ne.b32 p, $1, 0; vote.sync.balloc.b32 $0, p, $2;}",
+            constraints="=r,r,r",
+            args=[predicate, (1 << num_ties) - 1],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+
+    elif num_ties <= WARP_SIZE * 2:
+        pass
+    else:
+        pass
+
+
 def persistent_topk(
     logits: torch.Tensor,
     lengths: torch.Tensor,
@@ -2588,6 +3055,20 @@ def persistent_topk(
             K_MIN_SAMPLED_LENGTH=sampled_min_len,
             HISTOGRAM_SIZE=4096,
             HAS_TLE=True,
+            num_warps=32,
+        )
+        return
+
+    max_smem_per_block = device_props.shared_memory_per_block_optin
+    if num_rows > 32 and max_smem_per_block >= 128 * 1024:
+        # max_seq_len <= 32768
+        _filtered_topk_kernel[(num_rows,)](
+            logits,
+            output,
+            seq_lens,
+            num_rows,
+            k,
+            stride,
             num_warps=32,
         )
         return
