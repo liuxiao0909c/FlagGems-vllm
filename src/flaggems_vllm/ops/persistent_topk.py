@@ -2061,7 +2061,7 @@ def _per_row_cta_topk_selector(
 
 K_SAMPLE = 4096
 K_CAPACITY = 8192
-K_MIN_SAMPLED_LENGTH_K512 = 32768
+K_MIN_SAMPLED_LENGTH_K512 = 98304 # 32768
 K_MIN_SAMPLED_LENGTH_OTHER = 65536
 SAMPLED_SMEM_BYTES = 144 * 1024
 
@@ -2526,7 +2526,7 @@ def _histogram_vecs(
     s_histogram_ptr,
     mask,
     HIST_BITS: tl.constexpr,
-)
+):
     bins = _extract_coarse_bin_N(vecs0, HIST_BITS)
     tl.atomic_add(
         s_histogram_ptr + bins,
@@ -2541,6 +2541,7 @@ def _histogram_vecs(
 def _process_vecs(
     vecs0,
     row_offs,
+    zeros,
     out_ptr,
     s_counter_gt_ptr,
     s_counter_eq_ptr,
@@ -2551,10 +2552,10 @@ def _process_vecs(
     need_tie,
     HIST_BITS: tl.constexpr,
     TOPK: tl.constexpr,
-)
+):
     bins = _extract_coarse_bin_N(vecs0, HIST_BITS)
     gt_pos = tl.atomic_add(
-        s_counter_gt_ptr,
+        s_counter_gt_ptr + zeros,
         1,
         mask=bins > thr_bin,
         sem="relaxed",
@@ -2566,7 +2567,7 @@ def _process_vecs(
         mask=bins > thr_bin,
     )
     eq_pos = tl.atomic_add(
-        s_counter_eq_ptr,
+        s_counter_eq_ptr + zeros,
         1,
         mask=bins == thr_bin,
         sem="relaxed",
@@ -2592,7 +2593,44 @@ def _process_vecs(
 
 
 @triton.jit
-def _filtered_topk_kernel(
+def _tie_handle(
+    out_ptr,
+    s_tie_idx_ptr,
+    s_tie_score_ptr,
+    s_bin_ptr,
+    s_counter_ptr,
+    s_warp_sum_ptr,
+    s_histogram_ptr,
+    num_ties,
+    num_above,
+    TOPK: tl.constexpr,
+):
+    s_above_count_ptr = s_bin_ptr + 1
+    s_equal_count_ptr = s_bin_ptr + 2
+    return
+
+
+@triton.jit
+def _tie_handle_large(
+    out_ptr,
+    s_tie_idx_ptr,
+    s_tie_score_ptr,
+    s_bin_ptr,
+    s_counter_ptr,
+    s_warp_sum_ptr,
+    s_histogram_ptr,
+    num_ties,
+    num_above,
+    TOPK: tl.constexpr,
+):
+    s_above_count_ptr = s_bin_ptr + 1
+    s_equal_count_ptr = s_bin_ptr + 2
+    return
+
+
+# Adapted from vLLM: csrc/topk_histogram_4096.cuh
+@triton.jit
+def _histogram_4096_topk_kernel(
     logits,
     output,
     seq_lens,
@@ -2610,8 +2648,8 @@ def _filtered_topk_kernel(
     WARP_SIZE: tl.constexpr = 32
     NUM_WARPS: tl.constexpr = BLOCK_SIZE // WARP_SIZE  # 32
     MAX_TIES: tl.constexpr = 1024
-    TIE_CAPACITY: tl.constexpr = tl.maximum(TOPK, MAX_TIES)
-    BUFFER_SIZE: tl.constexpr = tl.maximum(HIST_BINS, TIE_CAPACITY)
+    TIE_CAPACITY: tl.constexpr = max(TOPK, MAX_TIES)  # 1024
+    BUFFER_SIZE: tl.constexpr = max(HIST_BINS, TIE_CAPACITY)  # 4096
 
     row_id = tl.program_id(0).to(tl.int64)
     row_ptr = logits + row_id * stride
@@ -2672,9 +2710,10 @@ def _filtered_topk_kernel(
     
     # Phase 1: Load all data into RF + build histogram
     # Zero the histogram (SMEM writes)
+    zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     tl.store(s_histogram_ptr + tl.arange(0, HIST_BINS), 0)
-    tl.store(s_counter_gt_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=offs == 0)
-    tl.store(s_counter_eq_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=offs == 0)
+    tl.store(s_counter_gt_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
+    tl.store(s_counter_eq_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
     row_offs = tl.arange(0, BLOCK_SIZE * ELEMS_PER_THREAD)
     # length <= BLOCK_SIZE * ELEMS_PER_THREAD, which is 32768
     VECS_PER_THREAD
@@ -2785,33 +2824,34 @@ def _filtered_topk_kernel(
         mask=tl.arange(0, WARP_SIZE)[:, None] < tl.arange(0, NUM_WARPS)[None, :],
         other=0,
     )
-    prefix = tl.reduce_sum(tmp, axis=-1)
+    prefix = tl.sum(tmp, axis=-1)
     prefix = prefix[None, :] + warp_inc[:, None] - local_sum.reshape(NUM_WARPS, WARP_SIZE)
+    prefix = prefix.reshape(BLOCK_SIZE)
     # Step 4: Find threshold - scan 4 bins, accumulate prefix
     prefix += orig0
     above = length - prefix
     mask = (above < TOPK) & (above + orig0 >= TOPK)
-    tl.store(s_bin_ptr, tl.arange(0, BLOCK_SIZE), mask)
-    tl.store(s_above_count_ptr, above, mask)
-    tl.store(s_equal_count_ptr, orig0, mask)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_above_count_ptr + zeros, above, mask)
+    tl.store(s_equal_count_ptr + zeros, orig0, mask)
     prefix += orig1
     above = length - prefix
     mask = (above < TOPK) & (above + orig1 >= TOPK)
-    tl.store(s_bin_ptr, tl.arange(0, BLOCK_SIZE), mask)
-    tl.store(s_above_count_ptr, above, mask)
-    tl.store(s_equal_count_ptr, orig1, mask)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_above_count_ptr + zeros, above, mask)
+    tl.store(s_equal_count_ptr + zeros, orig1, mask)
     prefix += orig2
     above = length - prefix
     mask = (above < TOPK) & (above + orig2 >= TOPK)
-    tl.store(s_bin_ptr, tl.arange(0, BLOCK_SIZE), mask)
-    tl.store(s_above_count_ptr, above, mask)
-    tl.store(s_equal_count_ptr, orig2, mask)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_above_count_ptr + zeros, above, mask)
+    tl.store(s_equal_count_ptr + zeros, orig2, mask)
     prefix += orig3
     above = length - prefix
     mask = (above < TOPK) & (above + orig3 >= TOPK)
-    tl.store(s_bin_ptr, tl.arange(0, BLOCK_SIZE), mask)
-    tl.store(s_above_count_ptr, above, mask)
-    tl.store(s_equal_count_ptr, orig3, mask)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_above_count_ptr + zeros, above, mask)
+    tl.store(s_equal_count_ptr + zeros, orig3, mask)
     tl.debug_barrier()
 
     # Phase 3: Scatter from registers
@@ -2819,9 +2859,11 @@ def _filtered_topk_kernel(
     num_above = tl.load(s_above_count_ptr)
     num_equal = tl.load(s_equal_count_ptr)
     need_tie = (num_equal + num_above > TOPK)
+    zeros_vec = tl.zeros([BLOCK_SIZE * VECS], dtype=tl.int32)
     _process_vecs(
         vecs0,
         row_offs,
+        zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
         s_counter_eq_ptr,
@@ -2836,6 +2878,7 @@ def _filtered_topk_kernel(
     _process_vecs(
         vecs1,
         row_offs + BLOCK_SIZE * VECS,
+        zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
         s_counter_eq_ptr,
@@ -2850,6 +2893,7 @@ def _filtered_topk_kernel(
     _process_vecs(
         vecs2,
         row_offs + BLOCK_SIZE * VECS * 2,
+        zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
         s_counter_eq_ptr,
@@ -2864,6 +2908,7 @@ def _filtered_topk_kernel(
     _process_vecs(
         vecs3,
         row_offs + BLOCK_SIZE * VECS * 3,
+        zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
         s_counter_eq_ptr,
@@ -2878,6 +2923,7 @@ def _filtered_topk_kernel(
     _process_vecs(
         vecs4,
         row_offs + BLOCK_SIZE * VECS * 4,
+        zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
         s_counter_eq_ptr,
@@ -2892,6 +2938,7 @@ def _filtered_topk_kernel(
     _process_vecs(
         vecs5,
         row_offs + BLOCK_SIZE * VECS * 5,
+        zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
         s_counter_eq_ptr,
@@ -2906,6 +2953,7 @@ def _filtered_topk_kernel(
     _process_vecs(
         vecs6,
         row_offs + BLOCK_SIZE * VECS * 6,
+        zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
         s_counter_eq_ptr,
@@ -2920,6 +2968,7 @@ def _filtered_topk_kernel(
     _process_vecs(
         vecs7,
         row_offs + BLOCK_SIZE * VECS * 7,
+        zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
         s_counter_eq_ptr,
@@ -2933,7 +2982,8 @@ def _filtered_topk_kernel(
     )
 
     # Phase 4: Tie-breaking
-    if (!need_tie) return
+    if not need_tie:
+        return
     tl.debug_barrier()
     num_ties = tl.minimum(num_equal, TOPK)
     topk_remain = TOPK - num_above
@@ -2952,31 +3002,117 @@ def _filtered_topk_kernel(
             other=0,
         )
         target_id = tl.load(
-            s_tie_idx_ptr + tl.arange(0, NUM_WARPS),
-            mask=tl.arange(0, NUM_WARPS) < num_ties,
+            s_tie_idx_ptr + tl.arange(0, WARP_SIZE),
+            mask=tl.arange(0, WARP_SIZE) < num_ties,
             other=BLOCK_SIZE * ELEMS_PER_THREAD,
         )
         target_score = tl.load(
-            s_tie_score_ptr + tl.arange(0, NUM_WARPS),
-            mask=tl.arange(0, NUM_WARPS) < num_ties,
+            s_tie_score_ptr + tl.arange(0, WARP_SIZE),
+            mask=tl.arange(0, WARP_SIZE) < num_ties,
             other=float("inf"),
         )
         pred = (tie_score[:, None] > target_score[None, :]) | (
-                ((tie_score[:, None] == target_score[None, :]) & (
+                (tie_score[:, None] == target_score[None, :]) & (
                     tie_id[:, None] < target_id[None, :]))
-        tl.inline_asm_elementwise(
-            "{.reg .pred p; setp.ne.b32 p, $1, 0; vote.sync.balloc.b32 $0, p, $2;}",
-            constraints="=r,r,r",
-            args=[predicate, (1 << num_ties) - 1],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-
+        # __popc(__ballot_sync(mask, pred)))
+        gt_cnt = tl.sum(pre.to(tl.int32), axis=-1)
+        tl.store(
+            out_ptr + num_above + gc_cnt + zeros, dtype=tl.int32),
+            target_id[None, :],
+            mask=(tl.arange(0, WARP_SIZE) == 0)[:, None] & (gt_cnt < topk_remain)[None, :],
     elif num_ties <= WARP_SIZE * 2:
-        pass
+        tie_id0 = tl.load(
+            s_tie_idx_ptr + tl.arange(0, WARP_SIZE),
+            mask=tl.arange(0, WARP_SIZE) < num_ties,
+            other=0,
+        )
+        tie_score0 = tl.load(
+            s_tie_score_ptr + tl.arange(0, WARP_SIZE),
+            mask=tl.arange(0, WARP_SIZE) < num_ties,
+            other=0,
+        )
+        tie_id1 = tl.load(
+            s_tie_idx_ptr + WARP_SIZE + tl.arange(0, WARP_SIZE),
+            mask=(WARP_SIZE + tl.arange(0, WARP_SIZE)) < num_ties,
+            other=0,
+        )
+        tie_score1 = tl.load(
+            s_tie_score_ptr + WARP_SIZE + tl.arange(0, WARP_SIZE),
+            mask=(WARP_SIZE + tl.arange(0, WARP_SIZE)) < num_ties,
+            other=0,
+        )
+        target_id0 = tl.load(
+            s_tie_idx_ptr + tl.arange(0, WARP_SIZE),
+            mask=tl.arange(0, WARP_SIZE) < num_ties,
+            other=BLOCK_SIZE * ELEMS_PER_THREAD,
+        )
+        target_score0 = tl.load(
+            s_tie_score_ptr + tl.arange(0, WARP_SIZE),
+            mask=tl.arange(0, WARP_SIZE) < num_ties,
+            other=float("inf"),
+        )
+        pred00 = (tie_score0[:, None] > target_score0[None, :]) | (
+                (tie_score0[:, None] == target_score0[None, :]) & (
+                    tie_id0[:, None] < target_id0[None, :]))
+        r00 = tl.sum(pred00.to(tl.int32), axis=-1)
+        pred10 = (tie_score1[:, None] > target_score0[None, :]) | (
+                (tie_score1[:, None] == target_score0[None, :]) & (
+                    tie_id1[:, None] < target_id0[None, :]))
+        r10 = tl.sum(pred10.to(tl.int32), axis=-1)
+        tl.store(
+            out_ptr + num_above + r00 + r10 + zeros, dtype=tl.int32),
+            target_id0[None, :],
+            mask=(tl.arange(0, WARP_SIZE) == 0)[:, None] & (r00 + r10 < topk_remain)[None, :],
+
+        target_id1 = tl.load(
+            s_tie_idx_ptr + WARP_SIZE + tl.arange(0, WARP_SIZE),
+            mask=(WARP_SIZE + tl.arange(0, WARP_SIZE)) < num_ties,
+            other=BLOCK_SIZE * ELEMS_PER_THREAD,
+        )
+        target_score1 = tl.load(
+            s_tie_score_ptr + tl.arange(0, WARP_SIZE),
+            mask=(tl.arange(0, WARP_SIZE) + WARP_SIZE) < num_ties,
+            other=float("inf"),
+        )
+        pred01 = (tie_score0[:, None] > target_score1[None, :]) | (
+                (tie_score0[:, None] == target_score1[None, :]) & (
+                    tie_id0[:, None] < target_id1[None, :]))
+        r01 = tl.sum(pred01.to(tl.int32), axis=-1)
+        pred11 = (tie_score1[:, None] > target_score1[None, :]) | (
+                (tie_score1[:, None] == target_score1[None, :]) & (
+                    tie_id1[:, None] < target_id1[None, :]))
+        r11 = tl.sum(pred11.to(tl.int32), axis=-1)
+        tl.store(
+            out_ptr + num_above + r01 + r11 + zeros, dtype=tl.int32),
+            target_id1[None, :],
+            mask=(tl.arange(0, WARP_SIZE) == 0)[:, None] & (r01 + r11 < topk_remain)[None, :],
     else:
-        pass
+        if TOPK <= BLOCK_SIZE:
+            _tie_handle(
+                out_ptr,
+                s_tie_idx_ptr,
+                s_tie_score_ptr,
+                s_bin_ptr,
+                s_counter_gt_ptr,
+                s_warp_sum_ptr,
+                s_histogram_ptr,
+                num_ties,
+                num_above,
+                TOPK,
+            )
+        else:
+            _tie_handle_large(
+                out_ptr,
+                s_tie_idx_ptr,
+                s_tie_score_ptr,
+                s_bin_ptr,
+                s_counter_gt_ptr,
+                s_warp_sum_ptr,
+                s_histogram_ptr,
+                num_ties,
+                num_above,
+                TOPK,
+            )
 
 
 def persistent_topk(
@@ -3062,7 +3198,7 @@ def persistent_topk(
     max_smem_per_block = device_props.shared_memory_per_block_optin
     if num_rows > 32 and max_smem_per_block >= 128 * 1024:
         # max_seq_len <= 32768
-        _filtered_topk_kernel[(num_rows,)](
+        _histogram_4096_topk_kernel[(num_rows,)](
             logits,
             output,
             seq_lens,
