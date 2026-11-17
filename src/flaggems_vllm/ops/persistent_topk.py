@@ -2729,6 +2729,17 @@ def _histogram_4096_topk_kernel(
         vecs5 = tl.load(row_ptr + row_offs + LOAD_SIZE * 5)
         vecs6 = tl.load(row_ptr + row_offs + LOAD_SIZE * 6)
         vecs7 = tl.load(row_ptr + row_offs + LOAD_SIZE * 7)
+        tl.debug_barrier()
+        # Build histogram from RF via atomic adds into the shared histogram
+        _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
+        _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
+        _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
+        _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
+        _histogram_vecs(vecs4, s_histogram_ptr, row_offs + LOAD_SIZE * 4 < length, HIST_BITS)
+        _histogram_vecs(vecs5, s_histogram_ptr, row_offs + LOAD_SIZE * 5 < length, HIST_BITS)
+        _histogram_vecs(vecs6, s_histogram_ptr, row_offs + LOAD_SIZE * 6 < length, HIST_BITS)
+        _histogram_vecs(vecs7, s_histogram_ptr, row_offs + LOAD_SIZE * 7 < length, HIST_BITS)
+        tl.debug_barrier()
     elif chunk_cnt == 7:
         vecs0 = tl.load(row_ptr + row_offs)
         vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
@@ -2738,6 +2749,15 @@ def _histogram_4096_topk_kernel(
         vecs5 = tl.load(row_ptr + row_offs + LOAD_SIZE * 5)
         vecs6 = tl.load(row_ptr + row_offs + LOAD_SIZE * 6)
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+        tl.debug_barrier()
+        _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
+        _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
+        _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
+        _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
+        _histogram_vecs(vecs4, s_histogram_ptr, row_offs + LOAD_SIZE * 4 < length, HIST_BITS)
+        _histogram_vecs(vecs5, s_histogram_ptr, row_offs + LOAD_SIZE * 5 < length, HIST_BITS)
+        _histogram_vecs(vecs6, s_histogram_ptr, row_offs + LOAD_SIZE * 6 < length, HIST_BITS)
+        tl.debug_barrier()
     elif chunk_cnt == 6:
         vecs0 = tl.load(row_ptr + row_offs)
         vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
@@ -2747,6 +2767,14 @@ def _histogram_4096_topk_kernel(
         vecs5 = tl.load(row_ptr + row_offs + LOAD_SIZE * 5)
         vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+        tl.debug_barrier()
+        _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
+        _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
+        _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
+        _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
+        _histogram_vecs(vecs4, s_histogram_ptr, row_offs + LOAD_SIZE * 4 < length, HIST_BITS)
+        _histogram_vecs(vecs5, s_histogram_ptr, row_offs + LOAD_SIZE * 5 < length, HIST_BITS)
+        tl.debug_barrier()
     elif chunk_cnt == 5:
         vecs0 = tl.load(row_ptr + row_offs)
         vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
@@ -2756,6 +2784,13 @@ def _histogram_4096_topk_kernel(
         vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+        tl.debug_barrier()
+        _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
+        _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
+        _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
+        _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
+        _histogram_vecs(vecs4, s_histogram_ptr, row_offs + LOAD_SIZE * 4 < length, HIST_BITS)
+        tl.debug_barrier()
     elif chunk_cnt == 4:
         vecs0 = tl.load(row_ptr + row_offs)
         vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
@@ -2765,6 +2800,12 @@ def _histogram_4096_topk_kernel(
         vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+        tl.debug_barrier()
+        _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
+        _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
+        _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
+        _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
+        tl.debug_barrier()
     elif chunk_cnt == 3:
         vecs0 = tl.load(row_ptr + row_offs)
         vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
@@ -2774,6 +2815,11 @@ def _histogram_4096_topk_kernel(
         vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+        tl.debug_barrier()
+        _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
+        _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
+        _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
+        tl.debug_barrier()
     elif chunk_cnt == 2:
         vecs0 = tl.load(row_ptr + row_offs)
         vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
@@ -2783,6 +2829,10 @@ def _histogram_4096_topk_kernel(
         vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+        tl.debug_barrier()
+        _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
+        _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
+        tl.debug_barrier()
     elif chunk_cnt == 1:
         vecs0 = tl.load(row_ptr + row_offs)
         vecs1 = tl.zeros([LOAD_SIZE], tl.float32)
@@ -2792,6 +2842,9 @@ def _histogram_4096_topk_kernel(
         vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+        tl.debug_barrier()
+        _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
+        tl.debug_barrier()
     else:
         vecs0 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs1 = tl.zeros([LOAD_SIZE], tl.float32)
@@ -2801,57 +2854,7 @@ def _histogram_4096_topk_kernel(
         vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
-    tl.debug_barrier()
-    # Build histogram from RF via atomic adds into the shared histogram
-    #_histogram_vecs(
-    #    vecs0,
-    #    s_histogram_ptr,
-    #    row_offs < length,
-    #    HIST_BITS,
-    #)
-    #_histogram_vecs(
-    #    vecs1,
-    #    s_histogram_ptr,
-    #    (row_offs + LOAD_SIZE) < length,
-    #    HIST_BITS,
-    #)
-    #_histogram_vecs(
-    #    vecs2,
-    #    s_histogram_ptr,
-    #    (row_offs + LOAD_SIZE * 2) < length,
-    #    HIST_BITS,
-    #)
-    #_histogram_vecs(
-    #    vecs3,
-    #    s_histogram_ptr,
-    #    (row_offs + LOAD_SIZE * 3) < length,
-    #    HIST_BITS,
-    #)
-    #_histogram_vecs(
-    #    vecs4,
-    #    s_histogram_ptr,
-    #    (row_offs + LOAD_SIZE * 4) < length,
-    #    HIST_BITS,
-    #)
-    #_histogram_vecs(
-    #    vecs5,
-    #    s_histogram_ptr,
-    #    (row_offs + LOAD_SIZE * 5) < length,
-    #    HIST_BITS,
-    #)
-    #_histogram_vecs(
-    #    vecs6,
-    #    s_histogram_ptr,
-    #    (row_offs + LOAD_SIZE * 6) < length,
-    #    HIST_BITS,
-    #)
-    #_histogram_vecs(
-    #    vecs7,
-    #    s_histogram_ptr,
-    #    (row_offs + LOAD_SIZE * 7) < length,
-    #    HIST_BITS,
-    #)
-    tl.debug_barrier()
+        tl.debug_barrier()
     return
     # Phase 2: Prefix scan to find threshold bin
     # Multi-element scan (4096 bins: 4 per thread)
@@ -2900,6 +2903,7 @@ def _histogram_4096_topk_kernel(
     tl.store(s_above_count_ptr + zeros, above, mask)
     tl.store(s_equal_count_ptr + zeros, orig3, mask)
     tl.debug_barrier()
+    return
 
     # Phase 3: Scatter from registers
     thr_bin = tl.load(s_bin_ptr)
