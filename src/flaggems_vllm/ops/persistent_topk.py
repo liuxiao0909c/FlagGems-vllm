@@ -2538,6 +2538,19 @@ def _histogram_vecs(
 
 
 @triton.jit
+def _warp_inclusive_sum(
+    local_sum,
+    BLOCK_SIZE: tl.constexpr,
+):
+    flag = local_sum.reshape(32, 32)
+    for i in range(1, 31):
+        flag += tl.where(lanes[None, :] > i, 0, )
+    warps = tl.arange(0, 32)
+    lanes = tl.arange(0, 32)
+
+
+
+@triton.jit
 def _process_vecs(
     vecs0,
     row_offs,
@@ -2855,7 +2868,7 @@ def _histogram_4096_topk_kernel(
         vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
         tl.debug_barrier()
-    return
+
     # Phase 2: Prefix scan to find threshold bin
     # Multi-element scan (4096 bins: 4 per thread)
     # Step 1: Each thread sums its 4 bins
@@ -2864,6 +2877,8 @@ def _histogram_4096_topk_kernel(
     orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * 2)
     orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * 3)
     local_sum = orig0 + orig1 + orig2 + orig3
+    tl.debug_barrier()
+
     # Step 2: Warp-level inclusive prefix sum on local_sum
     warp_inc = tl.sum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1)
     tl.store(s_warp_sum_ptr + tl.arange(0, NUM_WARPS), warp_inc)
