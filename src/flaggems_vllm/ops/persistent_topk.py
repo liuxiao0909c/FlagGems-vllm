@@ -2607,6 +2607,7 @@ def _tie_handle(
 ):
     s_above_count_ptr = s_bin_ptr + 1
     s_equal_count_ptr = s_bin_ptr + 2
+    tl.device_print("_tie_handle:", 1)
     return
 
 
@@ -2625,6 +2626,7 @@ def _tie_handle_large(
 ):
     s_above_count_ptr = s_bin_ptr + 1
     s_equal_count_ptr = s_bin_ptr + 2
+    tl.device_print("_tie_handle_large:", 1)
     return
 
 
@@ -2641,6 +2643,7 @@ def _histogram_4096_topk_kernel(
     BLOCK_SIZE: tl.constexpr = 1024
     HIST_BITS: tl.constexpr = 12
     VECS: tl.constexpr = 4
+    LOAD_SIZE: tl.constexpr = BLOCK_SIZE * VECS  # 4096
     VECS_PER_THREAD: tl.constexpr = 8
     ELEMS_PER_THREAD: tl.constexpr = VECS_PER_THREAD * VECS  # 32
     HIST_BINS: tl.constexpr = 1 << HIST_BITS  # 4096
@@ -2652,7 +2655,7 @@ def _histogram_4096_topk_kernel(
     BUFFER_SIZE: tl.constexpr = max(HIST_BINS, TIE_CAPACITY)  # 4096
 
     row_id = tl.program_id(0).to(tl.int64)
-    row_ptr = logits + row_id * stride
+    row_ptr = tl.multiple_of(logits + row_id * stride, VECS * 4)  # float4
     out_ptr = output + row_id * TOPK
     length = tl.load(seq_lens + row_id)  # <= 32768
     # smem
@@ -2714,98 +2717,142 @@ def _histogram_4096_topk_kernel(
     tl.store(s_histogram_ptr + tl.arange(0, HIST_BINS), 0)
     tl.store(s_counter_gt_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
     tl.store(s_counter_eq_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
-    row_offs = tl.arange(0, BLOCK_SIZE * ELEMS_PER_THREAD)
     # length <= BLOCK_SIZE * ELEMS_PER_THREAD, which is 32768
-    VECS_PER_THREAD
-    row_offs = tl.arange(0, BLOCK_SIZE * VECS)
-    vecs0 = tl.load(row_ptr + row_offs, mask=row_offs < length, other=0)
-    vecs1 = tl.load(
-        row_ptr + row_offs + BLOCK_SIZE * VECS,
-        mask=(row_offs + BLOCK_SIZE * VECS) < length,
-        other=0,
-    )
-    vecs2 = tl.load(
-        row_ptr + row_offs + BLOCK_SIZE * VECS * 2,
-        mask=(row_offs + BLOCK_SIZE * VECS * 2) < length,
-        other=0,
-    )
-    vecs3 = tl.load(
-        row_ptr + row_offs + BLOCK_SIZE * VECS * 3,
-        mask=(row_offs + BLOCK_SIZE * VECS * 3) < length,
-        other=0,
-    )
-    vecs4 = tl.load(
-        row_ptr + row_offs + BLOCK_SIZE * VECS * 4,
-        mask=(row_offs + BLOCK_SIZE * VECS * 4) < length,
-        other=0,
-    )
-    vecs5 = tl.load(
-        row_ptr + row_offs + BLOCK_SIZE * VECS * 5,
-        mask=(row_offs + BLOCK_SIZE * VECS * 5) < length,
-        other=0,
-    )
-    vecs6 = tl.load(
-        row_ptr + row_offs + BLOCK_SIZE * VECS * 6,
-        mask=(row_offs + BLOCK_SIZE * VECS * 6) < length,
-        other=0,
-    )
-    vecs7 = tl.load(
-        row_ptr + row_offs + BLOCK_SIZE * VECS * 7,
-        mask=(row_offs + BLOCK_SIZE * VECS * 7) < length,
-        other=0,
-    )
+    row_offs = tl.arange(0, LOAD_SIZE)
+    chunk_cnt = (length + LOAD_SIZE - 1) // LOAD_SIZE
+    if chunk_cnt == 8:
+        vecs0 = tl.load(row_ptr + row_offs)
+        vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
+        vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
+        vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3)
+        vecs4 = tl.load(row_ptr + row_offs + LOAD_SIZE * 4)
+        vecs5 = tl.load(row_ptr + row_offs + LOAD_SIZE * 5)
+        vecs6 = tl.load(row_ptr + row_offs + LOAD_SIZE * 6)
+        vecs7 = tl.load(row_ptr + row_offs + LOAD_SIZE * 7)
+    elif chunk_cnt == 7:
+        vecs0 = tl.load(row_ptr + row_offs)
+        vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
+        vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
+        vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3)
+        vecs4 = tl.load(row_ptr + row_offs + LOAD_SIZE * 4)
+        vecs5 = tl.load(row_ptr + row_offs + LOAD_SIZE * 5)
+        vecs6 = tl.load(row_ptr + row_offs + LOAD_SIZE * 6)
+        vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+    elif chunk_cnt == 6:
+        vecs0 = tl.load(row_ptr + row_offs)
+        vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
+        vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
+        vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3)
+        vecs4 = tl.load(row_ptr + row_offs + LOAD_SIZE * 4)
+        vecs5 = tl.load(row_ptr + row_offs + LOAD_SIZE * 5)
+        vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+    elif chunk_cnt == 5:
+        vecs0 = tl.load(row_ptr + row_offs)
+        vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
+        vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
+        vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3)
+        vecs4 = tl.load(row_ptr + row_offs + LOAD_SIZE * 4)
+        vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+    elif chunk_cnt == 4:
+        vecs0 = tl.load(row_ptr + row_offs)
+        vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
+        vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
+        vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3)
+        vecs4 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+    elif chunk_cnt == 3:
+        vecs0 = tl.load(row_ptr + row_offs)
+        vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
+        vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
+        vecs3 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs4 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+    elif chunk_cnt == 2:
+        vecs0 = tl.load(row_ptr + row_offs)
+        vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
+        vecs2 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs3 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs4 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+    elif chunk_cnt == 1:
+        vecs0 = tl.load(row_ptr + row_offs)
+        vecs1 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs2 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs3 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs4 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
+    else:
+        vecs0 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs1 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs2 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs3 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs4 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
+        vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
     tl.debug_barrier()
     # Build histogram from RF via atomic adds into the shared histogram
-    _histogram_vecs(
-        vecs0,
-        s_histogram_ptr,
-        row_offs < length,
-        HIST_BITS,
-    )
-    _histogram_vecs(
-        vecs1,
-        s_histogram_ptr,
-        (row_offs + BLOCK_SIZE * VECS) < length,
-        HIST_BITS,
-    )
-    _histogram_vecs(
-        vecs2,
-        s_histogram_ptr,
-        (row_offs + BLOCK_SIZE * VECS * 2) < length,
-        HIST_BITS,
-    )
-    _histogram_vecs(
-        vecs3,
-        s_histogram_ptr,
-        (row_offs + BLOCK_SIZE * VECS * 3) < length,
-        HIST_BITS,
-    )
-    _histogram_vecs(
-        vecs4,
-        s_histogram_ptr,
-        (row_offs + BLOCK_SIZE * VECS * 4) < length,
-        HIST_BITS,
-    )
-    _histogram_vecs(
-        vecs5,
-        s_histogram_ptr,
-        (row_offs + BLOCK_SIZE * VECS * 5) < length,
-        HIST_BITS,
-    )
-    _histogram_vecs(
-        vecs6,
-        s_histogram_ptr,
-        (row_offs + BLOCK_SIZE * VECS * 6) < length,
-        HIST_BITS,
-    )
-    _histogram_vecs(
-        vecs7,
-        s_histogram_ptr,
-        (row_offs + BLOCK_SIZE * VECS * 7) < length,
-        HIST_BITS,
-    )
+    #_histogram_vecs(
+    #    vecs0,
+    #    s_histogram_ptr,
+    #    row_offs < length,
+    #    HIST_BITS,
+    #)
+    #_histogram_vecs(
+    #    vecs1,
+    #    s_histogram_ptr,
+    #    (row_offs + LOAD_SIZE) < length,
+    #    HIST_BITS,
+    #)
+    #_histogram_vecs(
+    #    vecs2,
+    #    s_histogram_ptr,
+    #    (row_offs + LOAD_SIZE * 2) < length,
+    #    HIST_BITS,
+    #)
+    #_histogram_vecs(
+    #    vecs3,
+    #    s_histogram_ptr,
+    #    (row_offs + LOAD_SIZE * 3) < length,
+    #    HIST_BITS,
+    #)
+    #_histogram_vecs(
+    #    vecs4,
+    #    s_histogram_ptr,
+    #    (row_offs + LOAD_SIZE * 4) < length,
+    #    HIST_BITS,
+    #)
+    #_histogram_vecs(
+    #    vecs5,
+    #    s_histogram_ptr,
+    #    (row_offs + LOAD_SIZE * 5) < length,
+    #    HIST_BITS,
+    #)
+    #_histogram_vecs(
+    #    vecs6,
+    #    s_histogram_ptr,
+    #    (row_offs + LOAD_SIZE * 6) < length,
+    #    HIST_BITS,
+    #)
+    #_histogram_vecs(
+    #    vecs7,
+    #    s_histogram_ptr,
+    #    (row_offs + LOAD_SIZE * 7) < length,
+    #    HIST_BITS,
+    #)
     tl.debug_barrier()
-
+    return
     # Phase 2: Prefix scan to find threshold bin
     # Multi-element scan (4096 bins: 4 per thread)
     # Step 1: Each thread sums its 4 bins
@@ -2859,7 +2906,7 @@ def _histogram_4096_topk_kernel(
     num_above = tl.load(s_above_count_ptr)
     num_equal = tl.load(s_equal_count_ptr)
     need_tie = (num_equal + num_above > TOPK)
-    zeros_vec = tl.zeros([BLOCK_SIZE * VECS], dtype=tl.int32)
+    zeros_vec = tl.zeros([LOAD_SIZE], dtype=tl.int32)
     _process_vecs(
         vecs0,
         row_offs,
@@ -2877,7 +2924,7 @@ def _histogram_4096_topk_kernel(
     )
     _process_vecs(
         vecs1,
-        row_offs + BLOCK_SIZE * VECS,
+        row_offs + LOAD_SIZE,
         zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
@@ -2892,7 +2939,7 @@ def _histogram_4096_topk_kernel(
     )
     _process_vecs(
         vecs2,
-        row_offs + BLOCK_SIZE * VECS * 2,
+        row_offs + LOAD_SIZE * 2,
         zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
@@ -2907,7 +2954,7 @@ def _histogram_4096_topk_kernel(
     )
     _process_vecs(
         vecs3,
-        row_offs + BLOCK_SIZE * VECS * 3,
+        row_offs + LOAD_SIZE * 3,
         zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
@@ -2922,7 +2969,7 @@ def _histogram_4096_topk_kernel(
     )
     _process_vecs(
         vecs4,
-        row_offs + BLOCK_SIZE * VECS * 4,
+        row_offs + LOAD_SIZE * 4,
         zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
@@ -2937,7 +2984,7 @@ def _histogram_4096_topk_kernel(
     )
     _process_vecs(
         vecs5,
-        row_offs + BLOCK_SIZE * VECS * 5,
+        row_offs + LOAD_SIZE * 5,
         zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
@@ -2952,7 +2999,7 @@ def _histogram_4096_topk_kernel(
     )
     _process_vecs(
         vecs6,
-        row_offs + BLOCK_SIZE * VECS * 6,
+        row_offs + LOAD_SIZE * 6,
         zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
@@ -2967,7 +3014,7 @@ def _histogram_4096_topk_kernel(
     )
     _process_vecs(
         vecs7,
-        row_offs + BLOCK_SIZE * VECS * 7,
+        row_offs + LOAD_SIZE * 7,
         zeros_vec,
         out_ptr,
         s_counter_gt_ptr,
@@ -2985,8 +3032,10 @@ def _histogram_4096_topk_kernel(
     if not need_tie:
         return
     tl.debug_barrier()
+    return
     num_ties = tl.minimum(num_equal, TOPK)
     topk_remain = TOPK - num_above
+    #tl.device_print("num_ties:", num_ties)
     if num_ties <= WARP_SIZE:
         # <=32 ties - Use warp ballot
         # All-to-all comparison in one __ballot_sync. 32 ties x 32 warps = 1024
@@ -3015,11 +3064,12 @@ def _histogram_4096_topk_kernel(
                 (tie_score[:, None] == target_score[None, :]) & (
                     tie_id[:, None] < target_id[None, :]))
         # __popc(__ballot_sync(mask, pred)))
-        gt_cnt = tl.sum(pre.to(tl.int32), axis=-1)
+        gt_cnt = tl.sum(pred.to(tl.int32), axis=-1)
         tl.store(
-            out_ptr + num_above + gc_cnt + zeros, dtype=tl.int32),
+            out_ptr + num_above + gt_cnt[:, None].broadcast_to(WARP_SIZE, WARP_SIZE),
             target_id[None, :],
-            mask=(tl.arange(0, WARP_SIZE) == 0)[:, None] & (gt_cnt < topk_remain)[None, :],
+            mask=((tl.arange(0, WARP_SIZE) == 0) & (gt_cnt < topk_remain))[:, None],
+        )
     elif num_ties <= WARP_SIZE * 2:
         tie_id0 = tl.load(
             s_tie_idx_ptr + tl.arange(0, WARP_SIZE),
@@ -3060,9 +3110,10 @@ def _histogram_4096_topk_kernel(
                     tie_id1[:, None] < target_id0[None, :]))
         r10 = tl.sum(pred10.to(tl.int32), axis=-1)
         tl.store(
-            out_ptr + num_above + r00 + r10 + zeros, dtype=tl.int32),
+            out_ptr + num_above + (r00 + r10)[:, None].broadcast_to(WARP_SIZE, WARP_SIZE),
             target_id0[None, :],
-            mask=(tl.arange(0, WARP_SIZE) == 0)[:, None] & (r00 + r10 < topk_remain)[None, :],
+            mask=((tl.arange(0, WARP_SIZE) == 0) & (r00 + r10 < topk_remain))[:, None],
+        )
 
         target_id1 = tl.load(
             s_tie_idx_ptr + WARP_SIZE + tl.arange(0, WARP_SIZE),
@@ -3083,9 +3134,10 @@ def _histogram_4096_topk_kernel(
                     tie_id1[:, None] < target_id1[None, :]))
         r11 = tl.sum(pred11.to(tl.int32), axis=-1)
         tl.store(
-            out_ptr + num_above + r01 + r11 + zeros, dtype=tl.int32),
+            out_ptr + num_above + (r01 + r11)[:, None].broadcast_to(WARP_SIZE, WARP_SIZE),
             target_id1[None, :],
-            mask=(tl.arange(0, WARP_SIZE) == 0)[:, None] & (r01 + r11 < topk_remain)[None, :],
+            mask=((tl.arange(0, WARP_SIZE) == 0) & (r01 + r11 < topk_remain))[:, None],
+        )
     else:
         if TOPK <= BLOCK_SIZE:
             _tie_handle(
@@ -3197,7 +3249,7 @@ def persistent_topk(
 
     max_smem_per_block = device_props.shared_memory_per_block_optin
     if num_rows > 32 and max_smem_per_block >= 128 * 1024:
-        # max_seq_len <= 32768
+        # length <= 32768
         _histogram_4096_topk_kernel[(num_rows,)](
             logits,
             output,
