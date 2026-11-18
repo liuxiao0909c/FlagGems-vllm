@@ -2834,7 +2834,7 @@ def _histogram_4096_topk_kernel(
         vec_cnt = length // LOAD_SIZE
         for i in range(vec_cnt):
             vecs_i = tl.load(row_ptr + row_offs + LOAD_SIZE *  i)
-            tle.insert_tile(vecs, vecs_i[None, :], index=[i, 0])
+            vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[i, 0])
             _histogram_vecs(vecs_i, s_histogram_ptr, tl.full([LOAD_SIZE], True, dtype=tl.int1), HIST_BITS)
         # tail
         if vec_cnt < chunk_cnt:
