@@ -2872,53 +2872,71 @@ def _histogram_4096_topk_kernel(
     # Phase 2: Prefix scan to find threshold bin
     # Multi-element scan (4096 bins: 4 per thread)
     # Step 1: Each thread sums its 4 bins
-    orig0 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE))
-    orig1 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE)
-    orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * 2)
-    orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * 3)
+    orig0 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS)
+    orig1 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 1)
+    orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 2)
+    orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 3)
     local_sum = orig0 + orig1 + orig2 + orig3
     tl.debug_barrier()
 
     # Step 2: Warp-level inclusive prefix sum on local_sum
-    warp_inc = tl.sum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1)
-    tl.store(s_warp_sum_ptr + tl.arange(0, NUM_WARPS), warp_inc)
+    prefix_sum_ptr = s_histogram_ptr
+    tl.store(prefix_sum_ptr + tl.arange(0, BLOCK_SIZE), local_sum)
+    warps = tl.arange(0, NUM_WARPS)
+    lanes = tl.arange(0, WARP_SIZE)
+    # warp_inclusive_sum
+    for t in tl.static_range(0, 5):
+        # __shfl_up_sync
+        stride = 1 << t
+        val = tl.load(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :])
+        other_off = lanes - stride
+        masks = other_off >= 0
+        other_val = tl.load(
+            prefix_sum_ptr + warps[:, None] * WARP_SIZE + other_off[None, :],
+            mask=masks[None, :],
+            other=0,
+        )
+        val += other_val
+        tl.debug_barrier()
+        tl.store(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :], val)
+        tl.debug_barrier()
+    warp_inc = tl.load(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :])
+    warp_sum = tl.load(prefix_sum_ptr + warps * WARP_SIZE + WARP_SIZE - 1)
+    tl.store(s_warp_sum_ptr + warps, warp_sum)
     tl.debug_barrier()
+
     # Step 3: Inter-warp prefix across warp sums.
-    tmp = tl.load(
-        s_warp_sum_ptr + tl.arange(0, NUM_WARPS)[None, :],
-        mask=tl.arange(0, WARP_SIZE)[:, None] < tl.arange(0, NUM_WARPS)[None, :],
-        other=0,
-    )
-    prefix = tl.sum(tmp, axis=-1)
-    prefix = prefix[None, :] + warp_inc[:, None] - local_sum.reshape(NUM_WARPS, WARP_SIZE)
-    prefix = prefix.reshape(BLOCK_SIZE)
+    tmp = warp_sum #tl.load(s_warp_sum_ptr + lanes)
+    val = tl.where(lanes[None, :] < warps[:, None], tmp[None, :], 0)
+    # warp_reduce_sum_full, redux.sync.add.u32
+    prefix = tl.sum(val, axis=-1)
+    prefix = (prefix[None, :] + warp_inc).reshape(BLOCK_SIZE) - local_sum
     # Step 4: Find threshold - scan 4 bins, accumulate prefix
     prefix += orig0
     above = length - prefix
     mask = (above < TOPK) & (above + orig0 >= TOPK)
-    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS, mask)
     tl.store(s_above_count_ptr + zeros, above, mask)
     tl.store(s_equal_count_ptr + zeros, orig0, mask)
     prefix += orig1
     above = length - prefix
     mask = (above < TOPK) & (above + orig1 >= TOPK)
-    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 1, mask)
     tl.store(s_above_count_ptr + zeros, above, mask)
     tl.store(s_equal_count_ptr + zeros, orig1, mask)
     prefix += orig2
     above = length - prefix
     mask = (above < TOPK) & (above + orig2 >= TOPK)
-    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 2, mask)
     tl.store(s_above_count_ptr + zeros, above, mask)
     tl.store(s_equal_count_ptr + zeros, orig2, mask)
     prefix += orig3
     above = length - prefix
     mask = (above < TOPK) & (above + orig3 >= TOPK)
-    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 3, mask)
     tl.store(s_above_count_ptr + zeros, above, mask)
     tl.store(s_equal_count_ptr + zeros, orig3, mask)
     tl.debug_barrier()
-    return
 
     # Phase 3: Scatter from registers
     thr_bin = tl.load(s_bin_ptr)
