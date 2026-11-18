@@ -2729,7 +2729,7 @@ def persistent_topk(
         )
         return
 
-    if num_rows > 32 and max_smem_per_block >= 128 * 1024):
+    if num_rows > 32 and max_smem_per_block >= 128 * 1024:
         vec_size = 1
         if stride % 4 == 0:
             vec_size = 4
