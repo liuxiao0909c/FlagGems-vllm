@@ -2606,22 +2606,117 @@ def _process_vecs(
 
 
 @triton.jit
+def _find_threshold_bin(
+    s_histogram_ptr,
+    length,
+    topk,
+    s_bin_ptr,
+    s_above_count_ptr,
+    s_equal_count_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    HIST_BINS: tl.constexpr,
+):
+    lanes = tl.arange(0, BLOCK_SIZE)
+    zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+    THRESHOLD_ROUNDS: tl.constexpr = HIST_BINS // BLOCK_SIZE
+    threshold_found = tl.full((), False, dtype=tl.int1)
+    last_value = tl.zeros((), dtype=tl.int32)
+    for round_idx in tl.static_range(0, THRESHOLD_ROUNDS):
+        if not threshold_found:
+            round_bins = round_idx * BLOCK_SIZE + lanes
+            round_counts = tl.load(s_histogram_ptr + round_bins).to(tl.int32)
+            ps, round_total = tle.cumsum(round_counts, axis=0, reverse=False)
+            ps = ps + last_value
+            cum_total = last_value + round_total
+            nps = ps + round_counts
+            thr_mask = (ps <= topk) & (nps > topk)
+            tl.store(s_bin_ptr + zeros, round_bins, mask=thr_mask)
+            tl.store(s_above_count_ptr + zeros, length - ps, mask=thr_mask)
+            tl.store(s_equal_count_ptr + zeros, round_counts, mask=thr_mask)
+            threshold_found = tl.reduce_or(thr_mask, axis=0)
+            last_value = cum_total
+    tl.debug_barrier()
+
+
+@triton.jit
 def _tie_handle(
     out_ptr,
     s_tie_idx_ptr,
     s_tie_score_ptr,
     s_bin_ptr,
+    s_above_count_ptr,
+    s_equal_count_ptr,
     s_counter_ptr,
     s_warp_sum_ptr,
     s_histogram_ptr,
     num_ties,
     num_above,
     TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    s_above_count_ptr = s_bin_ptr + 1
-    s_equal_count_ptr = s_bin_ptr + 2
-    #tl.device_print("_tie_handle:", 1)
-    return
+    RADIX: tl.constexpr = 256
+    offs = tl.arange(0, BLOCK_SIZE)
+    zeros = tl.zeros([BLOCK_SIZE], 0, dtype=tl.int32)
+    
+    # Each thread loads one tie element.
+    has = offs < num_ties
+    tie_dix = tl.load(s_tie_idx_ptr + offs, mask=has, other=0)
+    tie_score = tl.load(s_tie_score_ptr + offs, mask=has, other=0.0)
+    key = _convert_to_uint32_v2(tie_score)
+
+    active = has
+    remain = TOPK - num_above
+    wpos = tl.full([BLOCK_SIZE], TOPK, dtype=tl.int32)
+    tl.store(s_counter_ptr + zeros, 0, mask=offs == 0)   # remove init and num_above later ?
+    tl.debug_barrier()
+    for r in tl.static_range(0, 4):
+        if remain > 0:
+            sh = 24 - r * 8
+            bins = (key >> sh) & 0xFF
+            # Step 1: Build 256-bin histogram.
+            tl.store(s_histogram_ptr + offs, 0, mask=offs < RADIX)
+            tl.debug_barrier()
+            tl.atomic_add(
+                s_histogram_ptr + bins,
+                1,
+                mask=active,
+                sem="relaxed",
+                scope="cta",
+            )
+            tl.debug_barrier()
+            # Step 2: Prefix scan to find threshold
+            _find_threshold_bin(
+                s_histogram_ptr,
+                num_ties,
+                remain,
+                s_bin_ptr,
+                s_above_count_ptr,
+                s_equal_count_ptr,
+                BLOCK_SIZE,
+                RADIX,
+            )
+            thr = tl.load(s_bin_ptr)
+            na = tl.load(s_above_count_ptr)
+            gt_mask = active & (bins > thr)
+            wpos_gt = num_above + tl.atomic_add(
+                s_counter_ptr + zeros,
+                1,
+                mask=gt_mask,
+                sem="relaxed",
+                scope="cta",
+            )
+            wpos = tl.where(gt_mask, wpos_gt, wpos)
+            eq_mask = active & (bins == thr) & (r == 3)
+            wpos_eq = TOPK - tl.atomic_add(
+                s_equal_count_ptr + zeros,
+                1,
+                mask=eq_mask,
+                sem="relaxed",
+                scope="cta",
+            )
+            wpos = tl.where(eq_mask, wpos_eq, wpos)
+            remain -= na
+    tl.store(out_ptr + wpos, tie_id, mask=wpos < TOPK)
 
 
 @triton.jit
@@ -2639,7 +2734,7 @@ def _tie_handle_large(
 ):
     s_above_count_ptr = s_bin_ptr + 1
     s_equal_count_ptr = s_bin_ptr + 2
-    #tl.device_print("_tie_handle_large:", 1)
+    tl.device_print("_tie_handle_large:", 1)
     return
 
 
@@ -2869,74 +2964,87 @@ def _histogram_4096_topk_kernel(
         vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
         tl.debug_barrier()
 
-    # Phase 2: Prefix scan to find threshold bin
-    # Multi-element scan (4096 bins: 4 per thread)
-    # Step 1: Each thread sums its 4 bins
-    orig0 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS)
-    orig1 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 1)
-    orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 2)
-    orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 3)
-    local_sum = orig0 + orig1 + orig2 + orig3
-    tl.debug_barrier()
-
-    # Step 2: Warp-level inclusive prefix sum on local_sum
-    prefix_sum_ptr = s_histogram_ptr
-    tl.store(prefix_sum_ptr + tl.arange(0, BLOCK_SIZE), local_sum)
-    warps = tl.arange(0, NUM_WARPS)
-    lanes = tl.arange(0, WARP_SIZE)
-    # warp_inclusive_sum
-    for t in tl.static_range(0, 5):
-        # __shfl_up_sync
-        stride = 1 << t
-        val = tl.load(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :])
-        other_off = lanes - stride
-        masks = other_off >= 0
-        other_val = tl.load(
-            prefix_sum_ptr + warps[:, None] * WARP_SIZE + other_off[None, :],
-            mask=masks[None, :],
-            other=0,
+    if True:
+        _find_threshold_bin(
+            s_histogram_ptr,
+            length,
+            TOPK,
+            s_bin_ptr,
+            s_above_count_ptr,
+            s_equal_count_ptr,
+            BLOCK_SIZE,
+            HIST_BINS,
         )
-        val += other_val
+    else:
+        # Phase 2: Prefix scan to find threshold bin
+        # Multi-element scan (4096 bins: 4 per thread)
+        # Step 1: Each thread sums its 4 bins
+        orig0 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS)
+        orig1 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 1)
+        orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 2)
+        orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 3)
+        local_sum = orig0 + orig1 + orig2 + orig3
         tl.debug_barrier()
-        tl.store(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :], val)
-        tl.debug_barrier()
-    warp_inc = tl.load(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :])
-    warp_sum = tl.load(prefix_sum_ptr + warps * WARP_SIZE + WARP_SIZE - 1)
-    tl.store(s_warp_sum_ptr + warps, warp_sum)
-    tl.debug_barrier()
 
-    # Step 3: Inter-warp prefix across warp sums.
-    tmp = warp_sum #tl.load(s_warp_sum_ptr + lanes)
-    val = tl.where(lanes[None, :] < warps[:, None], tmp[None, :], 0)
-    # warp_reduce_sum_full, redux.sync.add.u32
-    prefix = tl.sum(val, axis=-1)
-    prefix = (prefix[None, :] + warp_inc).reshape(BLOCK_SIZE) - local_sum
-    # Step 4: Find threshold - scan 4 bins, accumulate prefix
-    prefix += orig0
-    above = length - prefix
-    mask = (above < TOPK) & (above + orig0 >= TOPK)
-    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS, mask)
-    tl.store(s_above_count_ptr + zeros, above, mask)
-    tl.store(s_equal_count_ptr + zeros, orig0, mask)
-    prefix += orig1
-    above = length - prefix
-    mask = (above < TOPK) & (above + orig1 >= TOPK)
-    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 1, mask)
-    tl.store(s_above_count_ptr + zeros, above, mask)
-    tl.store(s_equal_count_ptr + zeros, orig1, mask)
-    prefix += orig2
-    above = length - prefix
-    mask = (above < TOPK) & (above + orig2 >= TOPK)
-    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 2, mask)
-    tl.store(s_above_count_ptr + zeros, above, mask)
-    tl.store(s_equal_count_ptr + zeros, orig2, mask)
-    prefix += orig3
-    above = length - prefix
-    mask = (above < TOPK) & (above + orig3 >= TOPK)
-    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 3, mask)
-    tl.store(s_above_count_ptr + zeros, above, mask)
-    tl.store(s_equal_count_ptr + zeros, orig3, mask)
-    tl.debug_barrier()
+        # Step 2: Warp-level inclusive prefix sum on local_sum
+        prefix_sum_ptr = s_histogram_ptr
+        tl.store(prefix_sum_ptr + tl.arange(0, BLOCK_SIZE), local_sum)
+        warps = tl.arange(0, NUM_WARPS)
+        lanes = tl.arange(0, WARP_SIZE)
+        # warp_inclusive_sum
+        for t in tl.static_range(0, 5):
+            # __shfl_up_sync
+            stride = 1 << t
+            val = tl.load(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :])
+            other_off = lanes - stride
+            masks = other_off >= 0
+            other_val = tl.load(
+                prefix_sum_ptr + warps[:, None] * WARP_SIZE + other_off[None, :],
+                mask=masks[None, :],
+                other=0,
+            )
+            val += other_val
+            tl.debug_barrier()
+            tl.store(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :], val)
+            tl.debug_barrier()
+        warp_inc = tl.load(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :])
+        warp_sum = tl.load(prefix_sum_ptr + warps * WARP_SIZE + WARP_SIZE - 1)
+        tl.store(s_warp_sum_ptr + warps, warp_sum)
+        tl.debug_barrier()
+
+        # Step 3: Inter-warp prefix across warp sums.
+        tmp = warp_sum #tl.load(s_warp_sum_ptr + lanes)
+        val = tl.where(lanes[None, :] < warps[:, None], tmp[None, :], 0)
+        # warp_reduce_sum_full, redux.sync.add.u32
+        prefix = tl.sum(val, axis=-1)
+        prefix = (prefix[None, :] + warp_inc).reshape(BLOCK_SIZE) - local_sum
+        # Step 4: Find threshold - scan 4 bins, accumulate prefix
+        prefix += orig0
+        above = length - prefix
+        mask = (above < TOPK) & (above + orig0 >= TOPK)
+        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS, mask)
+        tl.store(s_above_count_ptr + zeros, above, mask)
+        tl.store(s_equal_count_ptr + zeros, orig0, mask)
+        prefix += orig1
+        above = length - prefix
+        mask = (above < TOPK) & (above + orig1 >= TOPK)
+        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 1, mask)
+        tl.store(s_above_count_ptr + zeros, above, mask)
+        tl.store(s_equal_count_ptr + zeros, orig1, mask)
+        prefix += orig2
+        above = length - prefix
+        mask = (above < TOPK) & (above + orig2 >= TOPK)
+        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 2, mask)
+        tl.store(s_above_count_ptr + zeros, above, mask)
+        tl.store(s_equal_count_ptr + zeros, orig2, mask)
+        prefix += orig3
+        above = length - prefix
+        mask = (above < TOPK) & (above + orig3 >= TOPK)
+        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 3, mask)
+        tl.store(s_above_count_ptr + zeros, above, mask)
+        tl.store(s_equal_count_ptr + zeros, orig3, mask)
+        tl.debug_barrier()
+    return
 
     # Phase 3: Scatter from registers
     thr_bin = tl.load(s_bin_ptr)
@@ -3188,12 +3296,15 @@ def _histogram_4096_topk_kernel(
                 s_tie_idx_ptr,
                 s_tie_score_ptr,
                 s_bin_ptr,
+                s_above_count_ptr,
+                s_equal_count_ptr,
                 s_counter_gt_ptr,
                 s_warp_sum_ptr,
                 s_histogram_ptr,
                 num_ties,
                 num_above,
                 TOPK,
+                BLOCK_SIZE,
             )
         else:
             _tie_handle_large(
