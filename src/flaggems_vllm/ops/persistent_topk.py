@@ -1094,6 +1094,7 @@ def _test_kernel(
 ):
     RADIX_THRESHOLD: tl.constexpr = 32768
     RADIX: tl.constexpr = 256
+    HIST2048_THRESHOLD: tl.constexpr = 8192
 
     pid = tl.program_id(0)
     group_id = pid // ctas_per_group
@@ -1142,11 +1143,11 @@ def _test_kernel(
     shared_scalars_ptr = tle.gpu.local_ptr(shared_scalars, (0,))
     shared_ordered_ptr = tle.gpu.local_ptr(shared_ordered, (0,))
 
-    g_histogram_ptr += group_id * 3 * RADIX
-    g_state_ptr += group_id * 4
+    #g_histogram_ptr += group_id * 3 * RADIX
+    #g_state_ptr += group_id * 4
     barrier_phase = tl.zeros((), dtype=tl.uint32)
-    total_iters = tl.cdiv(num_rows, num_groups)
-    for i in tl.range(total_iters):
+    total_iters: tl.constexpr = 1 #tl.cdiv(num_rows, num_groups)
+    for i in tl.static_range(total_iters):
         row_idx = group_id + i * num_groups
         if row_idx < num_rows:
             seq_len = tl.load(lengths_ptr + row_idx)
@@ -1188,27 +1189,28 @@ def _test_kernel(
                             BLOCK_SIZE,
                         )
             else:
-                my_chunk_start = cta_in_group * CHUNK_SIZE
-                barrier_phase = _radix_topk(
-                    row_in,
-                    row_output,
-                    seq_len,
-                    my_chunk_start,
-                    CHUNK_SIZE,
-                    local_histogram_ptr,
-                    suffix_sum_ptr,
-                    shared_scalars_ptr,
-                    shared_ordered_ptr,
-                    g_histogram_ptr,
-                    g_state_ptr,
-                    cta_in_group,
-                    ctas_per_group,
-                    barrier_phase,
-                    i,
-                    TOPK,
-                    VEC_SIZE,
-                    BLOCK_SIZE,
-                )
+                pass
+                #my_chunk_start = cta_in_group * CHUNK_SIZE
+                #barrier_phase = _radix_topk(
+                #    row_in,
+                #    row_output,
+                #    seq_len,
+                #    my_chunk_start,
+                #    CHUNK_SIZE,
+                #    local_histogram_ptr,
+                #    suffix_sum_ptr,
+                #    shared_scalars_ptr,
+                #    shared_ordered_ptr,
+                #    g_histogram_ptr,
+                #    g_state_ptr,
+                #    cta_in_group,
+                #    ctas_per_group,
+                #    barrier_phase,
+                #    i,
+                #    TOPK,
+                #    VEC_SIZE,
+                #    BLOCK_SIZE,
+                #)
     return
 
 
@@ -2735,7 +2737,7 @@ def persistent_topk(
             vec_size = 4
         elif stride % 2 == 0:
             vec_size = 2
-        _test_kernel[(num_rows,)]()
+        _test_kernel[(num_rows,)](
             logits,
             output,
             seq_lens,
