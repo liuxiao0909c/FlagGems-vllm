@@ -1076,6 +1076,143 @@ def _histogram_2048_topk(
 
 
 @triton.jit
+def _test_kernel(
+    logits_ptr,
+    output_ptr,
+    lengths_ptr,
+    num_rows,
+    stride,
+    TOPK: tl.constexpr,
+    max_seq_len,
+    CHUNK_SIZE: tl.constexpr,
+    ctas_per_group,
+    num_groups,
+    g_histogram_ptr,
+    g_state_ptr,
+    VEC_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    RADIX_THRESHOLD: tl.constexpr = 32768
+    RADIX: tl.constexpr = 256
+
+    pid = tl.program_id(0)
+    group_id = pid // ctas_per_group
+    cta_in_group = pid % ctas_per_group
+    if pid >= num_groups * ctas_per_group:
+        return  # TODO: remove
+    if cta_in_group != 0 and max_seq_len <= RADIX_THRESHOLD:
+        return
+    local_histogram = tle.gpu.alloc(
+        [RADIX],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    suffix_sum = tle.gpu.alloc(
+        [RADIX],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    # TODO:why add 5 in FIXED_SMEM_LARGE
+    shared_scalars = tle.gpu.alloc(
+        [4],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    # shared_ordered is also reused (via offset pointers) by the medium and
+    # decode paths, mirroring vLLM's single extern __shared__ buffer. Size it
+    # to fit the larger of the large-path chunk and the medium/decode layout.
+    # 16384 = next_power_of_2(SMEM_MEDIUM // 4 = 8992); alloc requires pow2.
+    SMEM_MEDIUM_QUAD_C: tl.constexpr = 16384
+    ordered_size: tl.constexpr = max(CHUNK_SIZE, SMEM_MEDIUM_QUAD_C)
+    shared_ordered = tle.gpu.alloc(
+        [ordered_size],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    local_histogram_ptr = tle.gpu.local_ptr(local_histogram, (0,))
+    suffix_sum_ptr = tle.gpu.local_ptr(suffix_sum, (0,))
+    shared_scalars_ptr = tle.gpu.local_ptr(shared_scalars, (0,))
+    shared_ordered_ptr = tle.gpu.local_ptr(shared_ordered, (0,))
+
+    g_histogram_ptr += group_id * 3 * RADIX
+    g_state_ptr += group_id * 4
+    barrier_phase = tl.zeros((), dtype=tl.uint32)
+    total_iters = tl.cdiv(num_rows, num_groups)
+    for i in tl.range(total_iters):
+        row_idx = group_id + i * num_groups
+        if row_idx < num_rows:
+            seq_len = tl.load(lengths_ptr + row_idx)
+            row_output = output_ptr + row_idx * TOPK
+            row_in = tl.multiple_of(logits_ptr + row_idx * stride, VEC_SIZE * 4)
+            if seq_len <= RADIX_THRESHOLD:
+                if cta_in_group == 0:
+                    if seq_len <= TOPK:
+                        num_tiles: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
+                        lane = tl.arange(0, BLOCK_SIZE)
+                        for tile_idx in tl.static_range(0, num_tiles):
+                            pos = tile_idx * BLOCK_SIZE + lane
+                            take_row = pos < seq_len
+                            tl.store(
+                                row_output + pos,
+                                pos.to(tl.int32),
+                                mask=take_row,
+                            )
+                            take_pad = (pos >= seq_len) & (pos < TOPK)
+                            tl.store(row_output + pos, -1, mask=take_pad)
+                    elif seq_len <= HIST2048_THRESHOLD:
+                        _histogram_2048_topk(
+                            row_in,
+                            row_output,
+                            seq_len,
+                            shared_ordered_ptr,
+                            TOPK,
+                            VEC_SIZE,
+                            BLOCK_SIZE,
+                        )
+                    else:
+                        _histogram_256_topk(
+                            row_in,
+                            row_output,
+                            seq_len,
+                            shared_ordered_ptr,
+                            TOPK,
+                            VEC_SIZE,
+                            BLOCK_SIZE,
+                        )
+            else:
+                my_chunk_start = cta_in_group * CHUNK_SIZE
+                barrier_phase = _radix_topk(
+                    row_in,
+                    row_output,
+                    seq_len,
+                    my_chunk_start,
+                    CHUNK_SIZE,
+                    local_histogram_ptr,
+                    suffix_sum_ptr,
+                    shared_scalars_ptr,
+                    shared_ordered_ptr,
+                    g_histogram_ptr,
+                    g_state_ptr,
+                    cta_in_group,
+                    ctas_per_group,
+                    barrier_phase,
+                    i,
+                    TOPK,
+                    VEC_SIZE,
+                    BLOCK_SIZE,
+                )
+    return
+
+
+@triton.jit
 def persistent_topk_kernel(
     logits_ptr,
     output_ptr,
@@ -2061,7 +2198,7 @@ def _per_row_cta_topk_selector(
 
 K_SAMPLE = 4096
 K_CAPACITY = 8192
-K_MIN_SAMPLED_LENGTH_K512 = 32768
+K_MIN_SAMPLED_LENGTH_K512 = 98304 # 32768
 K_MIN_SAMPLED_LENGTH_OTHER = 65536
 SAMPLED_SMEM_BYTES = 144 * 1024
 
@@ -2589,6 +2726,31 @@ def persistent_topk(
             HISTOGRAM_SIZE=4096,
             HAS_TLE=True,
             num_warps=32,
+        )
+        return
+
+    if num_rows > 32 and max_smem_per_block >= 128 * 1024):
+        vec_size = 1
+        if stride % 4 == 0:
+            vec_size = 4
+        elif stride % 2 == 0:
+            vec_size = 2
+        _test_kernel[(num_rows,)]()
+            logits,
+            output,
+            seq_lens,
+            num_rows,
+            stride,
+            k,
+            max_seq_len,
+            stride, #chunk_size,
+            1, # ctas_per_group,
+            num_rows, # num_groups,
+            None, # g_histogram,
+            None, # g_state,
+            VEC_SIZE=vec_size,
+            BLOCK_SIZE=THREADS_PER_BLOCK,
+            num_warps=THREADS_PER_BLOCK // 32,
         )
         return
 
