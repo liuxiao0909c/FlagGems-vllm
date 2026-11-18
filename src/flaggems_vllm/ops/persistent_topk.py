@@ -2620,7 +2620,7 @@ def _tie_handle(
 ):
     s_above_count_ptr = s_bin_ptr + 1
     s_equal_count_ptr = s_bin_ptr + 2
-    tl.device_print("_tie_handle:", 1)
+    #tl.device_print("_tie_handle:", 1)
     return
 
 
@@ -2639,7 +2639,7 @@ def _tie_handle_large(
 ):
     s_above_count_ptr = s_bin_ptr + 1
     s_equal_count_ptr = s_bin_ptr + 2
-    tl.device_print("_tie_handle_large:", 1)
+    #tl.device_print("_tie_handle_large:", 1)
     return
 
 
@@ -2944,132 +2944,138 @@ def _histogram_4096_topk_kernel(
     num_equal = tl.load(s_equal_count_ptr)
     need_tie = (num_equal + num_above > TOPK)
     zeros_vec = tl.zeros([LOAD_SIZE], dtype=tl.int32)
-    _process_vecs(
-        vecs0,
-        row_offs,
-        zeros_vec,
-        out_ptr,
-        s_counter_gt_ptr,
-        s_counter_eq_ptr,
-        s_tie_idx_ptr,
-        s_tie_score_ptr,
-        thr_bin,
-        num_above,
-        need_tie,
-        HIST_BITS,
-        TOPK,
-    )
-    _process_vecs(
-        vecs1,
-        row_offs + LOAD_SIZE,
-        zeros_vec,
-        out_ptr,
-        s_counter_gt_ptr,
-        s_counter_eq_ptr,
-        s_tie_idx_ptr,
-        s_tie_score_ptr,
-        thr_bin,
-        num_above,
-        need_tie,
-        HIST_BITS,
-        TOPK,
-    )
-    _process_vecs(
-        vecs2,
-        row_offs + LOAD_SIZE * 2,
-        zeros_vec,
-        out_ptr,
-        s_counter_gt_ptr,
-        s_counter_eq_ptr,
-        s_tie_idx_ptr,
-        s_tie_score_ptr,
-        thr_bin,
-        num_above,
-        need_tie,
-        HIST_BITS,
-        TOPK,
-    )
-    _process_vecs(
-        vecs3,
-        row_offs + LOAD_SIZE * 3,
-        zeros_vec,
-        out_ptr,
-        s_counter_gt_ptr,
-        s_counter_eq_ptr,
-        s_tie_idx_ptr,
-        s_tie_score_ptr,
-        thr_bin,
-        num_above,
-        need_tie,
-        HIST_BITS,
-        TOPK,
-    )
-    _process_vecs(
-        vecs4,
-        row_offs + LOAD_SIZE * 4,
-        zeros_vec,
-        out_ptr,
-        s_counter_gt_ptr,
-        s_counter_eq_ptr,
-        s_tie_idx_ptr,
-        s_tie_score_ptr,
-        thr_bin,
-        num_above,
-        need_tie,
-        HIST_BITS,
-        TOPK,
-    )
-    _process_vecs(
-        vecs5,
-        row_offs + LOAD_SIZE * 5,
-        zeros_vec,
-        out_ptr,
-        s_counter_gt_ptr,
-        s_counter_eq_ptr,
-        s_tie_idx_ptr,
-        s_tie_score_ptr,
-        thr_bin,
-        num_above,
-        need_tie,
-        HIST_BITS,
-        TOPK,
-    )
-    _process_vecs(
-        vecs6,
-        row_offs + LOAD_SIZE * 6,
-        zeros_vec,
-        out_ptr,
-        s_counter_gt_ptr,
-        s_counter_eq_ptr,
-        s_tie_idx_ptr,
-        s_tie_score_ptr,
-        thr_bin,
-        num_above,
-        need_tie,
-        HIST_BITS,
-        TOPK,
-    )
-    _process_vecs(
-        vecs7,
-        row_offs + LOAD_SIZE * 7,
-        zeros_vec,
-        out_ptr,
-        s_counter_gt_ptr,
-        s_counter_eq_ptr,
-        s_tie_idx_ptr,
-        s_tie_score_ptr,
-        thr_bin,
-        num_above,
-        need_tie,
-        HIST_BITS,
-        TOPK,
-    )
+    if chunk_cnt >= 1:
+        _process_vecs(
+            vecs0,
+            row_offs,
+            zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
+    if chunk_cnt >= 2:
+        _process_vecs(
+            vecs1,
+            row_offs + LOAD_SIZE,
+            zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
+    if chunk_cnt >= 3:
+        _process_vecs(
+            vecs2,
+            row_offs + LOAD_SIZE * 2,
+            zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
+    if chunk_cnt >= 4:
+        _process_vecs(
+            vecs3,
+            row_offs + LOAD_SIZE * 3,
+            zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
+    if chunk_cnt >= 5:
+        _process_vecs(
+            vecs4,
+            row_offs + LOAD_SIZE * 4,
+            zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
+    if chunk_cnt >= 6:
+        _process_vecs(
+            vecs5,
+            row_offs + LOAD_SIZE * 5,
+            zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
+    if chunk_cnt >= 7:
+        _process_vecs(
+            vecs6,
+            row_offs + LOAD_SIZE * 6,
+            zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
+    if chunk_cnt >= 8:
+        _process_vecs(
+            vecs7,
+            row_offs + LOAD_SIZE * 7,
+            zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
 
     # Phase 4: Tie-breaking
     if not need_tie:
         return
-    tl.debug_barrier()
-    return
     num_ties = tl.minimum(num_equal, TOPK)
     topk_remain = TOPK - num_above
     #tl.device_print("num_ties:", num_ties)
