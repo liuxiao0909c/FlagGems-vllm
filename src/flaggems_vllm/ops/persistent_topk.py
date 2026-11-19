@@ -2818,6 +2818,14 @@ def _histogram_4096_topk_kernel(
         nv_mma_shared_layout=False,
     )
     s_tie_score_ptr = tle.gpu.local_ptr(s_tie_score, (0,))
+    s_vec = tle.gpu.alloc(
+        [ELEMS_PER_THREAD * BLOCK_SIZE],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_vec_ptr = tle.gpu.local_ptr(s_vec, (0,))
     
     # Phase 1: Load all data into RF + build histogram
     # Zero the histogram (SMEM writes)
@@ -2830,16 +2838,18 @@ def _histogram_4096_topk_kernel(
     load_offs = tl.arange(0, LOAD_SIZE)  # LOAD_SIZE = 1024 * 4
     chunk_cnt = (length + LOAD_SIZE - 1) // LOAD_SIZE
     vec_cnt = length // LOAD_SIZE
-    vecs = tl.full([8, LOAD_SIZE], float("-inf"), dtype=tl.float32)
+    #vecs = tl.full([8, LOAD_SIZE], float("-inf"), dtype=tl.float32)  use tle.insert_tile if out of smem
     for i in range(vec_cnt):
         vecs_offs = load_offs + LOAD_SIZE *  i
         vecs_i = tl.load(row_ptr + vecs_offs)
-        vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[i, 0])
+        tl.store(s_vec_ptr + vecs_offs, vecs_i)
+        #vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[i, 0])
         _histogram_vecs(vecs_i, s_histogram_ptr, tl.full([LOAD_SIZE], True, dtype=tl.int1), HIST_BITS)
     if vec_cnt < chunk_cnt:
         tail_offs = load_offs + LOAD_SIZE *  vec_cnt
         vecs_i = tl.load(row_ptr + tail_offs, mask=tail_offs < length, other=float("-inf"))
-        tle.insert_tile(vecs, vecs_i[None, :], index=[vec_cnt, 0])
+        tl.store(s_vec_ptr + tail_offs, vecs_i)
+        #vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[vec_cnt, 0])
         _histogram_vecs(vecs_i, s_histogram_ptr, tail_offs < length, HIST_BITS)
     tl.debug_barrier()
 
@@ -2895,10 +2905,12 @@ def _histogram_4096_topk_kernel(
     need_tie = (num_equal + num_above > TOPK)
     zeros_vec = tl.zeros([LOAD_SIZE], dtype=tl.int32)
     for i in range(chunk_cnt):
-        vecs_i = tle.extract_tile(vecs, index=[i, 0], tile_shape=[1, LOAD_SIZE]).reshape(LOAD_SIZE)
+        vecs_offs = load_offs + LOAD_SIZE *  i
+        vecs_i = tl.load(s_vec_ptr + vecs_offs)
+        #vecs_i = tle.extract_tile(vecs, index=[i, 0], tile_shape=[1, LOAD_SIZE]).reshape(LOAD_SIZE)
         _process_vecs(
             vecs_i,
-            i * LOAD_SIZE + load_offs,
+            vecs_offs,
             zeros_vec,
             out_ptr,
             s_counter_gt_ptr,
@@ -2912,6 +2924,7 @@ def _histogram_4096_topk_kernel(
             TOPK,
         )
 
+    return
     # Phase 4: Tie-breaking
     if not need_tie:
         return
