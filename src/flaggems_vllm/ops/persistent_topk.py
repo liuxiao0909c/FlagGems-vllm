@@ -2825,288 +2825,68 @@ def _histogram_4096_topk_kernel(
     tl.store(s_histogram_ptr + tl.arange(0, HIST_BINS), 0)
     tl.store(s_counter_gt_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
     tl.store(s_counter_eq_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
+    tl.debug_barrier()
     # length <= BLOCK_SIZE * ELEMS_PER_THREAD, which is 32768
-    row_offs = tl.arange(0, LOAD_SIZE)  # LOAD_SIZE = 1024 * 4
+    load_offs = tl.arange(0, LOAD_SIZE)  # LOAD_SIZE = 1024 * 4
     chunk_cnt = (length + LOAD_SIZE - 1) // LOAD_SIZE
-    if True:
-        tl.debug_barrier()
-        vecs = tl.full([8, LOAD_SIZE], float("-inf"), dtype=tl.float32)
-        vec_cnt = length // LOAD_SIZE
-        for i in range(vec_cnt):
-            vecs_i = tl.load(row_ptr + row_offs + LOAD_SIZE *  i)
-            vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[i, 0])
-            _histogram_vecs(vecs_i, s_histogram_ptr, tl.full([LOAD_SIZE], True, dtype=tl.int1), HIST_BITS)
-        # tail
-        if vec_cnt < chunk_cnt:
-            tail_offs = row_offs + LOAD_SIZE *  vec_cnt
-            vecs_i = tl.load(row_ptr + tail_offs, mask=tail_offs < length, other=float("-inf"))
-            tle.insert_tile(vecs, vecs_i[None, :], index=[vec_cnt, 0])
-            _histogram_vecs(vecs_i, s_histogram_ptr, tail_offs < length, HIST_BITS)
-        tl.debug_barrier()
-        pass
-    else:
-        if chunk_cnt == 8:
-            vecs0 = tl.load(row_ptr + row_offs)
-            vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
-            vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
-            vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3)
-            vecs4 = tl.load(row_ptr + row_offs + LOAD_SIZE * 4)
-            vecs5 = tl.load(row_ptr + row_offs + LOAD_SIZE * 5)
-            vecs6 = tl.load(row_ptr + row_offs + LOAD_SIZE * 6)
-            vecs7 = tl.load(row_ptr + row_offs + LOAD_SIZE * 7, mask=row_offs + LOAD_SIZE * 7 < length, other=float("-inf"))
-            tl.debug_barrier()
-            # Build histogram from RF via atomic adds into the shared histogram
-            _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
-            _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
-            _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
-            _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
-            _histogram_vecs(vecs4, s_histogram_ptr, row_offs + LOAD_SIZE * 4 < length, HIST_BITS)
-            _histogram_vecs(vecs5, s_histogram_ptr, row_offs + LOAD_SIZE * 5 < length, HIST_BITS)
-            _histogram_vecs(vecs6, s_histogram_ptr, row_offs + LOAD_SIZE * 6 < length, HIST_BITS)
-            _histogram_vecs(vecs7, s_histogram_ptr, row_offs + LOAD_SIZE * 7 < length, HIST_BITS)
-            tl.debug_barrier()
-        elif chunk_cnt == 7:
-            vecs0 = tl.load(row_ptr + row_offs)
-            vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
-            vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
-            vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3)
-            vecs4 = tl.load(row_ptr + row_offs + LOAD_SIZE * 4)
-            vecs5 = tl.load(row_ptr + row_offs + LOAD_SIZE * 5)
-            vecs6 = tl.load(row_ptr + row_offs + LOAD_SIZE * 6, mask=row_offs + LOAD_SIZE * 6 < length, other=float("-inf"))
-            vecs7 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            tl.debug_barrier()
-            _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
-            _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
-            _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
-            _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
-            _histogram_vecs(vecs4, s_histogram_ptr, row_offs + LOAD_SIZE * 4 < length, HIST_BITS)
-            _histogram_vecs(vecs5, s_histogram_ptr, row_offs + LOAD_SIZE * 5 < length, HIST_BITS)
-            _histogram_vecs(vecs6, s_histogram_ptr, row_offs + LOAD_SIZE * 6 < length, HIST_BITS)
-            tl.debug_barrier()
-        elif chunk_cnt == 6:
-            vecs0 = tl.load(row_ptr + row_offs)
-            vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
-            vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
-            vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3)
-            vecs4 = tl.load(row_ptr + row_offs + LOAD_SIZE * 4)
-            vecs5 = tl.load(row_ptr + row_offs + LOAD_SIZE * 5, mask=row_offs + LOAD_SIZE * 5 < length, other=float("-inf"))
-            vecs6 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs7 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            tl.debug_barrier()
-            _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
-            _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
-            _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
-            _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
-            _histogram_vecs(vecs4, s_histogram_ptr, row_offs + LOAD_SIZE * 4 < length, HIST_BITS)
-            _histogram_vecs(vecs5, s_histogram_ptr, row_offs + LOAD_SIZE * 5 < length, HIST_BITS)
-            tl.debug_barrier()
-        elif chunk_cnt == 5:
-            vecs0 = tl.load(row_ptr + row_offs)
-            vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
-            vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
-            vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3)
-            vecs4 = tl.load(row_ptr + row_offs + LOAD_SIZE * 4, mask=row_offs + LOAD_SIZE * 4 < length, other=float("-inf"))
-            vecs5 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs6 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs7 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            tl.debug_barrier()
-            _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
-            _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
-            _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
-            _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
-            _histogram_vecs(vecs4, s_histogram_ptr, row_offs + LOAD_SIZE * 4 < length, HIST_BITS)
-            tl.debug_barrier()
-        elif chunk_cnt == 4:
-            vecs0 = tl.load(row_ptr + row_offs)
-            vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
-            vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2)
-            vecs3 = tl.load(row_ptr + row_offs + LOAD_SIZE * 3, mask=row_offs + LOAD_SIZE * 3 < length, other=float("-inf"))
-            vecs4 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs5 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs6 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs7 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            tl.debug_barrier()
-            _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
-            _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
-            _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
-            _histogram_vecs(vecs3, s_histogram_ptr, row_offs + LOAD_SIZE * 3 < length, HIST_BITS)
-            tl.debug_barrier()
-        elif chunk_cnt == 3:
-            vecs0 = tl.load(row_ptr + row_offs)
-            vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE)
-            vecs2 = tl.load(row_ptr + row_offs + LOAD_SIZE * 2, mask=row_offs + LOAD_SIZE * 2 < length, other=float("-inf"))
-            vecs3 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs4 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs5 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs6 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs7 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            tl.debug_barrier()
-            _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
-            _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
-            _histogram_vecs(vecs2, s_histogram_ptr, row_offs + LOAD_SIZE * 2 < length, HIST_BITS)
-            tl.debug_barrier()
-        elif chunk_cnt == 2:
-            vecs0 = tl.load(row_ptr + row_offs)
-            vecs1 = tl.load(row_ptr + row_offs + LOAD_SIZE, mask=row_offs + LOAD_SIZE < length, other=float("-inf"))
-            vecs2 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs3 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs4 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs5 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs6 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs7 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            tl.debug_barrier()
-            _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
-            _histogram_vecs(vecs1, s_histogram_ptr, row_offs + LOAD_SIZE < length, HIST_BITS)
-            tl.debug_barrier()
-        elif chunk_cnt == 1:
-            vecs0 = tl.load(row_ptr + row_offs, row_offs < length, other=float("-inf"))
-            vecs1 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs2 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs3 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs4 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs5 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs6 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            vecs7 = tl.full([LOAD_SIZE], float("-inf"), tl.float32)
-            tl.debug_barrier()
-            _histogram_vecs(vecs0, s_histogram_ptr, row_offs < length, HIST_BITS)
-            tl.debug_barrier()
-        else:
-            vecs0 = tl.zeros([LOAD_SIZE], tl.float32)
-            vecs1 = tl.zeros([LOAD_SIZE], tl.float32)
-            vecs2 = tl.zeros([LOAD_SIZE], tl.float32)
-            vecs3 = tl.zeros([LOAD_SIZE], tl.float32)
-            vecs4 = tl.zeros([LOAD_SIZE], tl.float32)
-            vecs5 = tl.zeros([LOAD_SIZE], tl.float32)
-            vecs6 = tl.zeros([LOAD_SIZE], tl.float32)
-            vecs7 = tl.zeros([LOAD_SIZE], tl.float32)
-            tl.debug_barrier()
+    vec_cnt = length // LOAD_SIZE
+    vecs = tl.full([8, LOAD_SIZE], float("-inf"), dtype=tl.float32)
+    for i in range(vec_cnt):
+        vecs_offs = load_offs + LOAD_SIZE *  i
+        vecs_i = tl.load(row_ptr + vecs_offs)
+        vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[i, 0])
+        _histogram_vecs(vecs_i, s_histogram_ptr, tl.full([LOAD_SIZE], True, dtype=tl.int1), HIST_BITS)
+    if vec_cnt < chunk_cnt:
+        tail_offs = load_offs + LOAD_SIZE *  vec_cnt
+        vecs_i = tl.load(row_ptr + tail_offs, mask=tail_offs < length, other=float("-inf"))
+        tle.insert_tile(vecs, vecs_i[None, :], index=[vec_cnt, 0])
+        _histogram_vecs(vecs_i, s_histogram_ptr, tail_offs < length, HIST_BITS)
+    tl.debug_barrier()
 
-    if False:
-        _find_threshold_bin(
-            s_histogram_ptr,
-            length,
-            TOPK,
-            s_bin_ptr,
-            s_above_count_ptr,
-            s_equal_count_ptr,
-            BLOCK_SIZE,
-            HIST_BINS,
-        )
-    elif True:
-        orig0 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS)
-        orig1 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 1)
-        orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 2)
-        orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 3)
-        local_sum = orig0 + orig1 + orig2 + orig3
-        #excl_ps, total = tle.cumsum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1, reverse=False) # [NUM_WARPS, WARP_SIZE], [NUM_WARPS]
-        total = tl.sum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1)
-        excl_ps = total[:, None] - tl.cumsum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1, reverse=True)
-        warp_inc = excl_ps
-        warp_sum = total
-        warps = tl.arange(0, NUM_WARPS)
-        lanes = tl.arange(0, WARP_SIZE)
-        # Step 3: Inter-warp prefix across warp sums.
-        tmp = warp_sum #tl.load(s_warp_sum_ptr + lanes)
-        val = tl.where(lanes[None, :] < warps[:, None], tmp[None, :], 0)
-        # warp_reduce_sum_full, redux.sync.add.u32
-        prefix = tl.sum(val, axis=-1)
-        prefix = (prefix[None, :] + warp_inc).reshape(BLOCK_SIZE) - local_sum
-        # Step 4: Find threshold - scan 4 bins, accumulate prefix
-        prefix += orig0
-        above = length - prefix
-        mask = (above < TOPK) & (above + orig0 >= TOPK)
-        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS, mask)
-        tl.store(s_above_count_ptr + zeros, above, mask)
-        tl.store(s_equal_count_ptr + zeros, orig0, mask)
-        prefix += orig1
-        above = length - prefix
-        mask = (above < TOPK) & (above + orig1 >= TOPK)
-        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 1, mask)
-        tl.store(s_above_count_ptr + zeros, above, mask)
-        tl.store(s_equal_count_ptr + zeros, orig1, mask)
-        prefix += orig2
-        above = length - prefix
-        mask = (above < TOPK) & (above + orig2 >= TOPK)
-        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 2, mask)
-        tl.store(s_above_count_ptr + zeros, above, mask)
-        tl.store(s_equal_count_ptr + zeros, orig2, mask)
-        prefix += orig3
-        above = length - prefix
-        mask = (above < TOPK) & (above + orig3 >= TOPK)
-        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 3, mask)
-        tl.store(s_above_count_ptr + zeros, above, mask)
-        tl.store(s_equal_count_ptr + zeros, orig3, mask)
-        tl.debug_barrier()
-    else:
-        # Phase 2: Prefix scan to find threshold bin
-        # Multi-element scan (4096 bins: 4 per thread)
-        # Step 1: Each thread sums its 4 bins
-        orig0 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS)
-        orig1 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 1)
-        orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 2)
-        orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 3)
-        local_sum = orig0 + orig1 + orig2 + orig3
-        tl.debug_barrier()
-
-        # Step 2: Warp-level inclusive prefix sum on local_sum
-        prefix_sum_ptr = s_histogram_ptr
-        tl.store(prefix_sum_ptr + tl.arange(0, BLOCK_SIZE), local_sum)
-        warps = tl.arange(0, NUM_WARPS)
-        lanes = tl.arange(0, WARP_SIZE)
-        # warp_inclusive_sum
-        for t in tl.static_range(0, 5):
-            # __shfl_up_sync
-            stride = 1 << t
-            val = tl.load(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :])
-            other_off = lanes - stride
-            masks = other_off >= 0
-            other_val = tl.load(
-                prefix_sum_ptr + warps[:, None] * WARP_SIZE + other_off[None, :],
-                mask=masks[None, :],
-                other=0,
-            )
-            val += other_val
-            tl.debug_barrier()
-            tl.store(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :], val)
-            tl.debug_barrier()
-        warp_inc = tl.load(prefix_sum_ptr + warps[:, None] * WARP_SIZE + lanes[None, :])
-        warp_sum = tl.load(prefix_sum_ptr + warps * WARP_SIZE + WARP_SIZE - 1)
-        tl.store(s_warp_sum_ptr + warps, warp_sum)
-        tl.debug_barrier()
-
-        # Step 3: Inter-warp prefix across warp sums.
-        tmp = warp_sum #tl.load(s_warp_sum_ptr + lanes)
-        val = tl.where(lanes[None, :] < warps[:, None], tmp[None, :], 0)
-        # warp_reduce_sum_full, redux.sync.add.u32
-        prefix = tl.sum(val, axis=-1)
-        prefix = (prefix[None, :] + warp_inc).reshape(BLOCK_SIZE) - local_sum
-        # Step 4: Find threshold - scan 4 bins, accumulate prefix
-        prefix += orig0
-        above = length - prefix
-        mask = (above < TOPK) & (above + orig0 >= TOPK)
-        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS, mask)
-        tl.store(s_above_count_ptr + zeros, above, mask)
-        tl.store(s_equal_count_ptr + zeros, orig0, mask)
-        prefix += orig1
-        above = length - prefix
-        mask = (above < TOPK) & (above + orig1 >= TOPK)
-        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 1, mask)
-        tl.store(s_above_count_ptr + zeros, above, mask)
-        tl.store(s_equal_count_ptr + zeros, orig1, mask)
-        prefix += orig2
-        above = length - prefix
-        mask = (above < TOPK) & (above + orig2 >= TOPK)
-        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 2, mask)
-        tl.store(s_above_count_ptr + zeros, above, mask)
-        tl.store(s_equal_count_ptr + zeros, orig2, mask)
-        prefix += orig3
-        above = length - prefix
-        mask = (above < TOPK) & (above + orig3 >= TOPK)
-        tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 3, mask)
-        tl.store(s_above_count_ptr + zeros, above, mask)
-        tl.store(s_equal_count_ptr + zeros, orig3, mask)
-        tl.debug_barrier()
-
+    orig0 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS)
+    orig1 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 1)
+    orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 2)
+    orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 3)
+    local_sum = orig0 + orig1 + orig2 + orig3
+    #excl_ps, total = tle.cumsum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1, reverse=False) # [NUM_WARPS, WARP_SIZE], [NUM_WARPS]
+    total = tl.sum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1)
+    excl_ps = total[:, None] - tl.cumsum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1, reverse=True)
+    warp_inc = excl_ps
+    warp_sum = total
+    warps = tl.arange(0, NUM_WARPS)
+    lanes = tl.arange(0, WARP_SIZE)
+    # Step 3: Inter-warp prefix across warp sums.
+    tmp = warp_sum #tl.load(s_warp_sum_ptr + lanes)
+    val = tl.where(lanes[None, :] < warps[:, None], tmp[None, :], 0)
+    # warp_reduce_sum_full, redux.sync.add.u32
+    prefix = tl.sum(val, axis=-1)
+    prefix = (prefix[None, :] + warp_inc).reshape(BLOCK_SIZE) - local_sum
+    # Step 4: Find threshold - scan 4 bins, accumulate prefix
+    prefix += orig0
+    above = length - prefix
+    mask = (above < TOPK) & (above + orig0 >= TOPK)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS, mask)
+    tl.store(s_above_count_ptr + zeros, above, mask)
+    tl.store(s_equal_count_ptr + zeros, orig0, mask)
+    prefix += orig1
+    above = length - prefix
+    mask = (above < TOPK) & (above + orig1 >= TOPK)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 1, mask)
+    tl.store(s_above_count_ptr + zeros, above, mask)
+    tl.store(s_equal_count_ptr + zeros, orig1, mask)
+    prefix += orig2
+    above = length - prefix
+    mask = (above < TOPK) & (above + orig2 >= TOPK)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 2, mask)
+    tl.store(s_above_count_ptr + zeros, above, mask)
+    tl.store(s_equal_count_ptr + zeros, orig2, mask)
+    prefix += orig3
+    above = length - prefix
+    mask = (above < TOPK) & (above + orig3 >= TOPK)
+    tl.store(s_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * VECS + 3, mask)
+    tl.store(s_above_count_ptr + zeros, above, mask)
+    tl.store(s_equal_count_ptr + zeros, orig3, mask)
+    tl.debug_barrier()
 
     # Phase 3: Scatter from registers
     thr_bin = tl.load(s_bin_ptr)
@@ -3114,156 +2894,24 @@ def _histogram_4096_topk_kernel(
     num_equal = tl.load(s_equal_count_ptr)
     need_tie = (num_equal + num_above > TOPK)
     zeros_vec = tl.zeros([LOAD_SIZE], dtype=tl.int32)
-    if True:
-        for i in range(chunk_cnt):
-            vecs_i = tle.extract_tile(vecs, index=[i, 0], tile_shape=[1, LOAD_SIZE]).reshape(LOAD_SIZE)
-            _process_vecs(
-                vecs_i,
-                row_offs,
-                zeros_vec,
-                out_ptr,
-                s_counter_gt_ptr,
-                s_counter_eq_ptr,
-                s_tie_idx_ptr,
-                s_tie_score_ptr,
-                thr_bin,
-                num_above,
-                need_tie,
-                HIST_BITS,
-                TOPK,
-            )
-        pass
-    else:
-        if chunk_cnt >= 1:
-            _process_vecs(
-                vecs0,
-                row_offs,
-                zeros_vec,
-                out_ptr,
-                s_counter_gt_ptr,
-                s_counter_eq_ptr,
-                s_tie_idx_ptr,
-                s_tie_score_ptr,
-                thr_bin,
-                num_above,
-                need_tie,
-                HIST_BITS,
-                TOPK,
-            )
-        if chunk_cnt >= 2:
-            _process_vecs(
-                vecs1,
-                row_offs + LOAD_SIZE,
-                zeros_vec,
-                out_ptr,
-                s_counter_gt_ptr,
-                s_counter_eq_ptr,
-                s_tie_idx_ptr,
-                s_tie_score_ptr,
-                thr_bin,
-                num_above,
-                need_tie,
-                HIST_BITS,
-                TOPK,
-            )
-        if chunk_cnt >= 3:
-            _process_vecs(
-                vecs2,
-                row_offs + LOAD_SIZE * 2,
-                zeros_vec,
-                out_ptr,
-                s_counter_gt_ptr,
-                s_counter_eq_ptr,
-                s_tie_idx_ptr,
-                s_tie_score_ptr,
-                thr_bin,
-                num_above,
-                need_tie,
-                HIST_BITS,
-                TOPK,
-            )
-        if chunk_cnt >= 4:
-            _process_vecs(
-                vecs3,
-                row_offs + LOAD_SIZE * 3,
-                zeros_vec,
-                out_ptr,
-                s_counter_gt_ptr,
-                s_counter_eq_ptr,
-                s_tie_idx_ptr,
-                s_tie_score_ptr,
-                thr_bin,
-                num_above,
-                need_tie,
-                HIST_BITS,
-                TOPK,
-            )
-        if chunk_cnt >= 5:
-            _process_vecs(
-                vecs4,
-                row_offs + LOAD_SIZE * 4,
-                zeros_vec,
-                out_ptr,
-                s_counter_gt_ptr,
-                s_counter_eq_ptr,
-                s_tie_idx_ptr,
-                s_tie_score_ptr,
-                thr_bin,
-                num_above,
-                need_tie,
-                HIST_BITS,
-                TOPK,
-            )
-        if chunk_cnt >= 6:
-            _process_vecs(
-                vecs5,
-                row_offs + LOAD_SIZE * 5,
-                zeros_vec,
-                out_ptr,
-                s_counter_gt_ptr,
-                s_counter_eq_ptr,
-                s_tie_idx_ptr,
-                s_tie_score_ptr,
-                thr_bin,
-                num_above,
-                need_tie,
-                HIST_BITS,
-                TOPK,
-            )
-        if chunk_cnt >= 7:
-            _process_vecs(
-                vecs6,
-                row_offs + LOAD_SIZE * 6,
-                zeros_vec,
-                out_ptr,
-                s_counter_gt_ptr,
-                s_counter_eq_ptr,
-                s_tie_idx_ptr,
-                s_tie_score_ptr,
-                thr_bin,
-                num_above,
-                need_tie,
-                HIST_BITS,
-                TOPK,
-            )
-        if chunk_cnt >= 8:
-            _process_vecs(
-                vecs7,
-                row_offs + LOAD_SIZE * 7,
-                zeros_vec,
-                out_ptr,
-                s_counter_gt_ptr,
-                s_counter_eq_ptr,
-                s_tie_idx_ptr,
-                s_tie_score_ptr,
-                thr_bin,
-                num_above,
-                need_tie,
-                HIST_BITS,
-                TOPK,
-            )
+    for i in range(chunk_cnt):
+        vecs_i = tle.extract_tile(vecs, index=[i, 0], tile_shape=[1, LOAD_SIZE]).reshape(LOAD_SIZE)
+        _process_vecs(
+            vecs_i,
+            i * LOAD_SIZE + load_offs,
+            zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
 
-    return
     # Phase 4: Tie-breaking
     if not need_tie:
         return
