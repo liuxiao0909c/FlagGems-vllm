@@ -2565,6 +2565,8 @@ def _process_vecs(
     need_tie,
     HIST_BITS: tl.constexpr,
     TOPK: tl.constexpr,
+    dump_ptr,
+    DUMP_FLAG,
 ):
     bins = _extract_coarse_bin_N(vecs0, HIST_BITS)
     gt_pos = tl.atomic_add(
@@ -2574,6 +2576,12 @@ def _process_vecs(
         sem="relaxed",
         scope="cta",
     )
+    if DUMP_FLAG:
+        tl.store(dump_ptr + 4096*16 + tl.arange(0, 4096), vecs0.to(tl.int32, bitcast=True))
+        tl.store(dump_ptr + 4096*12 + tl.arange(0, 4096), bins)
+        tl.store(dump_ptr + 4096*13 + tl.arange(0, 4096), bins > thr_bin)
+        tl.store(dump_ptr + 4096*14 + tl.arange(0, 4096), gt_pos)
+        tl.store(dump_ptr + 4096*15 + tl.arange(0, 4096), row_offs)
     tl.store(
         out_ptr + gt_pos,
         row_offs,
@@ -2747,6 +2755,8 @@ def _histogram_4096_topk_kernel(
     num_rows,
     TOPK: tl.constexpr,
     stride,
+    dump_buf,
+    g_vec,
 ):
     BLOCK_SIZE: tl.constexpr = 1024
     HIST_BITS: tl.constexpr = 12
@@ -2763,8 +2773,11 @@ def _histogram_4096_topk_kernel(
     BUFFER_SIZE: tl.constexpr = max(HIST_BINS, TIE_CAPACITY)  # 4096
 
     row_id = tl.program_id(0).to(tl.int64)
+    DUMP_FLAG = row_id == 120
     row_ptr = tl.multiple_of(logits + row_id * stride, VECS * 4)  # float4
     out_ptr = output + row_id * TOPK
+    dump_ptr = dump_buf #+ row_id * 4096
+    g_vec_ptr = g_vec + row_id * 32768
     length = tl.load(seq_lens + row_id)  # <= 32768
     # smem
     s_match_bin = tle.gpu.alloc(
@@ -2826,6 +2839,7 @@ def _histogram_4096_topk_kernel(
         nv_mma_shared_layout=False,
     )
     s_vec_ptr = tle.gpu.local_ptr(s_vec, (0,))
+    s_vec_ptr = g_vec_ptr
     
     # Phase 1: Load all data into RF + build histogram
     # Zero the histogram (SMEM writes)
@@ -2840,14 +2854,16 @@ def _histogram_4096_topk_kernel(
     vec_cnt = length // LOAD_SIZE
     #vecs = tl.full([8, LOAD_SIZE], float("-inf"), dtype=tl.float32)  use tle.insert_tile if out of smem
     for i in range(vec_cnt):
-        vecs_offs = load_offs + LOAD_SIZE *  i
+        vecs_offs = load_offs + LOAD_SIZE * i
         vecs_i = tl.load(row_ptr + vecs_offs)
+        #vecs = tl.where(tl.arange(0, 8)[:, None] == i, vecs_i[None, :], vecs)
         tl.store(s_vec_ptr + vecs_offs, vecs_i)
         #vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[i, 0])
         _histogram_vecs(vecs_i, s_histogram_ptr, tl.full([LOAD_SIZE], True, dtype=tl.int1), HIST_BITS)
     if vec_cnt < chunk_cnt:
-        tail_offs = load_offs + LOAD_SIZE *  vec_cnt
+        tail_offs = load_offs + LOAD_SIZE * vec_cnt
         vecs_i = tl.load(row_ptr + tail_offs, mask=tail_offs < length, other=float("-inf"))
+        #vecs = tl.where(tl.arange(0, 8)[:, None] == vec_cnt, vecs_i[None, :], vecs)
         tl.store(s_vec_ptr + tail_offs, vecs_i)
         #vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[vec_cnt, 0])
         _histogram_vecs(vecs_i, s_histogram_ptr, tail_offs < length, HIST_BITS)
@@ -2858,19 +2874,38 @@ def _histogram_4096_topk_kernel(
     orig2 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 2)
     orig3 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS + 3)
     local_sum = orig0 + orig1 + orig2 + orig3
+    if DUMP_FLAG:
+        tl.store(dump_ptr + tl.arange(0, 4096), tl.load(s_histogram_ptr + tl.arange(0, 4096)))
+        tl.store(dump_ptr + 4096*7 + tl.arange(0, BLOCK_SIZE), local_sum)
+
     #excl_ps, total = tle.cumsum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1, reverse=False) # [NUM_WARPS, WARP_SIZE], [NUM_WARPS]
     total = tl.sum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1)
-    excl_ps = total[:, None] - tl.cumsum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1, reverse=True)
-    warp_inc = excl_ps
+    incl_ps = tl.cumsum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1, reverse=False)
+    #excl_ps = total[:, None] - tl.cumsum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1, reverse=True)
+    #warp_inc = excl_ps
+    warp_inc = incl_ps
+    if DUMP_FLAG:
+        tl.store(dump_ptr + 4096*2 + tl.arange(0, 1024), warp_inc.reshape(BLOCK_SIZE))
+        tl.store(dump_ptr + 4096*3 + tl.arange(0, NUM_WARPS), total)
     warp_sum = total
     warps = tl.arange(0, NUM_WARPS)
     lanes = tl.arange(0, WARP_SIZE)
     # Step 3: Inter-warp prefix across warp sums.
     tmp = warp_sum #tl.load(s_warp_sum_ptr + lanes)
     val = tl.where(lanes[None, :] < warps[:, None], tmp[None, :], 0)
+    if DUMP_FLAG:
+        tl.store(dump_ptr + 4096*5 + tl.arange(0, 1024), val.reshape(BLOCK_SIZE))
     # warp_reduce_sum_full, redux.sync.add.u32
     prefix = tl.sum(val, axis=-1)
-    prefix = (prefix[None, :] + warp_inc).reshape(BLOCK_SIZE) - local_sum
+    if DUMP_FLAG:
+        tl.store(dump_ptr + 4096*6 + tl.arange(0, NUM_WARPS), prefix)
+    #prefix = (prefix[None, :] + warp_inc).reshape(BLOCK_SIZE) - local_sum
+    tmp00 = (prefix[:, None] + warp_inc).reshape(BLOCK_SIZE)
+    if DUMP_FLAG:
+        tl.store(dump_ptr + 4096*8 + tl.arange(0, 1024), tmp00.reshape(BLOCK_SIZE))
+    prefix = (prefix[:, None] + warp_inc).reshape(BLOCK_SIZE) - local_sum
+    if DUMP_FLAG:
+        tl.store(dump_ptr + 4096*4 + tl.arange(0, 1024), prefix.reshape(BLOCK_SIZE))
     # Step 4: Find threshold - scan 4 bins, accumulate prefix
     prefix += orig0
     above = length - prefix
@@ -2902,6 +2937,11 @@ def _histogram_4096_topk_kernel(
     thr_bin = tl.load(s_bin_ptr)
     num_above = tl.load(s_above_count_ptr)
     num_equal = tl.load(s_equal_count_ptr)
+    if DUMP_FLAG:
+        tl.store(dump_ptr + 4096, thr_bin)
+        tl.store(dump_ptr + 4096 + 1, num_above)
+        tl.store(dump_ptr + 4096 + 2, num_equal)
+        tl.store(dump_ptr + 4096 + 3, (num_equal + num_above > TOPK))
     need_tie = (num_equal + num_above > TOPK)
     zeros_vec = tl.zeros([LOAD_SIZE], dtype=tl.int32)
     for i in range(chunk_cnt):
@@ -2922,12 +2962,14 @@ def _histogram_4096_topk_kernel(
             need_tie,
             HIST_BITS,
             TOPK,
+            dump_ptr,
+            DUMP_FLAG & (i == 0),
         )
 
-    return
     # Phase 4: Tie-breaking
     if not need_tie:
         return
+    tl.debug_barrier()
     num_ties = tl.minimum(num_equal, TOPK)
     topk_remain = TOPK - num_above
     #tl.device_print("num_ties:", num_ties)
@@ -2938,58 +2980,58 @@ def _histogram_4096_topk_kernel(
         tie_id = tl.load(
             s_tie_idx_ptr + tl.arange(0, WARP_SIZE),
             mask=tl.arange(0, WARP_SIZE) < num_ties,
-            other=0,
+            other=BLOCK_SIZE * ELEMS_PER_THREAD,
         )
         tie_score = tl.load(
             s_tie_score_ptr + tl.arange(0, WARP_SIZE),
             mask=tl.arange(0, WARP_SIZE) < num_ties,
-            other=0,
+            other=float("-inf"),
         )
         target_id = tl.load(
             s_tie_idx_ptr + tl.arange(0, WARP_SIZE),
             mask=tl.arange(0, WARP_SIZE) < num_ties,
-            other=BLOCK_SIZE * ELEMS_PER_THREAD,
+            other=0,
         )
         target_score = tl.load(
             s_tie_score_ptr + tl.arange(0, WARP_SIZE),
             mask=tl.arange(0, WARP_SIZE) < num_ties,
             other=float("inf"),
         )
-        pred = (tie_score[:, None] > target_score[None, :]) | (
-                (tie_score[:, None] == target_score[None, :]) & (
-                    tie_id[:, None] < target_id[None, :]))
+        pred = (tie_score[None, :] > target_score[:, None]) | (
+                (tie_score[None, :] == target_score[:, None]) & (
+                    tie_id[None, :] < target_id[:, None]))
         # __popc(__ballot_sync(mask, pred)))
         gt_cnt = tl.sum(pred.to(tl.int32), axis=-1)
         tl.store(
-            out_ptr + num_above + gt_cnt[:, None].broadcast_to(WARP_SIZE, WARP_SIZE),
-            target_id[None, :],
-            mask=((tl.arange(0, WARP_SIZE) == 0) & (gt_cnt < topk_remain))[:, None],
+            out_ptr + num_above + gt_cnt,
+            target_id,
+            mask=(gt_cnt < topk_remain) & (tl.arange(0, WARP_SIZE) < num_ties),
         )
     elif num_ties <= WARP_SIZE * 2:
         tie_id0 = tl.load(
             s_tie_idx_ptr + tl.arange(0, WARP_SIZE),
             mask=tl.arange(0, WARP_SIZE) < num_ties,
-            other=0,
+            other=BLOCK_SIZE * ELEMS_PER_THREAD,
         )
         tie_score0 = tl.load(
             s_tie_score_ptr + tl.arange(0, WARP_SIZE),
             mask=tl.arange(0, WARP_SIZE) < num_ties,
-            other=0,
+            other=float("-inf"),
         )
         tie_id1 = tl.load(
             s_tie_idx_ptr + WARP_SIZE + tl.arange(0, WARP_SIZE),
             mask=(WARP_SIZE + tl.arange(0, WARP_SIZE)) < num_ties,
-            other=0,
+            other=BLOCK_SIZE * ELEMS_PER_THREAD,
         )
         tie_score1 = tl.load(
             s_tie_score_ptr + WARP_SIZE + tl.arange(0, WARP_SIZE),
             mask=(WARP_SIZE + tl.arange(0, WARP_SIZE)) < num_ties,
-            other=0,
+            other=float("-inf"),
         )
         target_id0 = tl.load(
             s_tie_idx_ptr + tl.arange(0, WARP_SIZE),
             mask=tl.arange(0, WARP_SIZE) < num_ties,
-            other=BLOCK_SIZE * ELEMS_PER_THREAD,
+            other=0,
         )
         target_score0 = tl.load(
             s_tie_score_ptr + tl.arange(0, WARP_SIZE),
@@ -3005,15 +3047,14 @@ def _histogram_4096_topk_kernel(
                     tie_id1[:, None] < target_id0[None, :]))
         r10 = tl.sum(pred10.to(tl.int32), axis=-1)
         tl.store(
-            out_ptr + num_above + (r00 + r10)[:, None].broadcast_to(WARP_SIZE, WARP_SIZE),
-            target_id0[None, :],
-            mask=((tl.arange(0, WARP_SIZE) == 0) & (r00 + r10 < topk_remain))[:, None],
+            out_ptr + num_above + (r00 + r10),
+            target_id0,
+            mask=((r00 + r10) < topk_remain) & (tl.arange(0, WARP_SIZE) < num_ties),
         )
-
         target_id1 = tl.load(
             s_tie_idx_ptr + WARP_SIZE + tl.arange(0, WARP_SIZE),
             mask=(WARP_SIZE + tl.arange(0, WARP_SIZE)) < num_ties,
-            other=BLOCK_SIZE * ELEMS_PER_THREAD,
+            other=0,
         )
         target_score1 = tl.load(
             s_tie_score_ptr + tl.arange(0, WARP_SIZE),
@@ -3029,9 +3070,9 @@ def _histogram_4096_topk_kernel(
                     tie_id1[:, None] < target_id1[None, :]))
         r11 = tl.sum(pred11.to(tl.int32), axis=-1)
         tl.store(
-            out_ptr + num_above + (r01 + r11)[:, None].broadcast_to(WARP_SIZE, WARP_SIZE),
-            target_id1[None, :],
-            mask=((tl.arange(0, WARP_SIZE) == 0) & (r01 + r11 < topk_remain))[:, None],
+            out_ptr + num_above + (r01 + r11),
+            target_id0,
+            mask=((r01 + r11) < topk_remain) & (tl.arange(0, WARP_SIZE) < num_ties),
         )
     else:
         if TOPK <= BLOCK_SIZE:
@@ -3148,6 +3189,8 @@ def persistent_topk(
     max_smem_per_block = device_props.shared_memory_per_block_optin
     if num_rows > 32 and max_smem_per_block >= 128 * 1024:
         # length <= 32768
+        buf = torch.zeros([num_rows, 4096], dtype=torch.int32, device=logits.device)
+        g_vec = torch.zeros([num_rows, 32768], dtype=torch.float32, device=logits.device)
         _histogram_4096_topk_kernel[(num_rows,)](
             logits,
             output,
@@ -3155,8 +3198,11 @@ def persistent_topk(
             num_rows,
             k,
             stride,
+            buf,
+            g_vec,
             num_warps=32,
         )
+        import pdb; pdb.set_trace()
         return
 
     if num_rows > 32:
