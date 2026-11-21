@@ -2834,25 +2834,32 @@ def _histogram_4096_topk_kernel(
     tl.store(s_counter_gt_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
     tl.store(s_counter_eq_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
     tl.debug_barrier()
+
     # length <= BLOCK_SIZE * ELEMS_PER_THREAD, which is 32768
-    load_offs = tl.arange(0, LOAD_SIZE)  # LOAD_SIZE = 1024 * 4
+    vec_offs = tl.arange(0, LOAD_SIZE)  # LOAD_SIZE = 1024 * 4
     chunk_cnt = (length + LOAD_SIZE - 1) // LOAD_SIZE
     vec_cnt = length // LOAD_SIZE
+    norm_cnt = (length - vec_cnt * LOAD_SIZE + (BLOCK_SIZE - 1)) // BLOCK_SIZE
     #vecs = tl.full([8, LOAD_SIZE], float("-inf"), dtype=tl.float32)  use tle.insert_tile if out of smem
     for i in range(vec_cnt):
-        vecs_offs = load_offs + LOAD_SIZE * i
-        vecs_i = tl.load(row_ptr + vecs_offs)
+        cur_offs = vec_offs + LOAD_SIZE * i
+        vecs_i = tl.load(row_ptr + cur_offs)
         #vecs = tl.where(tl.arange(0, 8)[:, None] == i, vecs_i[None, :], vecs)
-        tl.store(s_vec_ptr + vecs_offs, vecs_i)
+        tl.store(s_vec_ptr + cur_offs, vecs_i)
         #vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[i, 0])
         _histogram_vecs(vecs_i, s_histogram_ptr, tl.full([LOAD_SIZE], True, dtype=tl.int1), HIST_BITS)
-    if vec_cnt < chunk_cnt:
-        tail_offs = load_offs + LOAD_SIZE * vec_cnt
-        vecs_i = tl.load(row_ptr + tail_offs, mask=tail_offs < length, other=float("-inf"))
-        #vecs = tl.where(tl.arange(0, 8)[:, None] == vec_cnt, vecs_i[None, :], vecs)
-        tl.store(s_vec_ptr + tail_offs, vecs_i)
-        #vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[vec_cnt, 0])
-        _histogram_vecs(vecs_i, s_histogram_ptr, tail_offs < length, HIST_BITS)
+    for j in range(norm_cnt):
+        tail_offs = LOAD_SIZE * vec_cnt + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * j
+        x = tl.load(row_ptr + tail_offs, mask=tail_offs < length, other=float("-inf"))
+        tl.store(s_vec_ptr + tail_offs, x)
+        _histogram_vecs(x, s_histogram_ptr, tail_offs < length, HIST_BITS)
+    #if vec_cnt < chunk_cnt:
+    #    tail_offs = vec_offs + LOAD_SIZE * vec_cnt
+    #    vecs_i = tl.load(row_ptr + tail_offs, mask=tail_offs < length, other=float("-inf"))
+    #    #vecs = tl.where(tl.arange(0, 8)[:, None] == vec_cnt, vecs_i[None, :], vecs)
+    #    tl.store(s_vec_ptr + tail_offs, vecs_i)
+    #    #vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[vec_cnt, 0])
+    #    _histogram_vecs(vecs_i, s_histogram_ptr, tail_offs < length, HIST_BITS)
     tl.debug_barrier()
 
     orig0 = tl.load(s_histogram_ptr + tl.arange(0, BLOCK_SIZE) * VECS)
@@ -2907,14 +2914,32 @@ def _histogram_4096_topk_kernel(
     num_equal = tl.load(s_equal_count_ptr)
     need_tie = (num_equal + num_above > TOPK)
     zeros_vec = tl.zeros([LOAD_SIZE], dtype=tl.int32)
-    for i in range(chunk_cnt):
-        vecs_offs = load_offs + LOAD_SIZE *  i
-        vecs_i = tl.load(s_vec_ptr + vecs_offs)
+    for i in range(vec_cnt):
+        cur_offs = vec_offs + LOAD_SIZE *  i
+        vecs_i = tl.load(s_vec_ptr + cur_offs)
         #vecs_i = tle.extract_tile(vecs, index=[i, 0], tile_shape=[1, LOAD_SIZE]).reshape(LOAD_SIZE)
         _process_vecs(
             vecs_i,
-            vecs_offs,
+            cur_offs,
             zeros_vec,
+            out_ptr,
+            s_counter_gt_ptr,
+            s_counter_eq_ptr,
+            s_tie_idx_ptr,
+            s_tie_score_ptr,
+            thr_bin,
+            num_above,
+            need_tie,
+            HIST_BITS,
+            TOPK,
+        )
+    for j in range(norm_cnt):
+        tail_offs = LOAD_SIZE * vec_cnt + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * j
+        x = tl.load(s_vec_ptr + tail_offs)
+        _process_vecs(
+            x,
+            tail_offs,
+            zeros,
             out_ptr,
             s_counter_gt_ptr,
             s_counter_eq_ptr,
@@ -2933,7 +2958,6 @@ def _histogram_4096_topk_kernel(
     tl.debug_barrier()
     num_ties = tl.minimum(num_equal, TOPK)
     topk_remain = TOPK - num_above
-    #tl.device_print("num_ties:", num_ties)
     if num_ties <= WARP_SIZE:
         # <=32 ties - Use warp ballot
         # All-to-all comparison in one __ballot_sync. 32 ties x 32 warps = 1024
