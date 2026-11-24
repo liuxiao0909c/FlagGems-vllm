@@ -992,7 +992,7 @@ def _histogram_256_topk_v2(
             scope="cta",
         )
     tl.debug_barrier()
-    # return  # 0.018688
+    #return  # 0.018688
 
     src_buffered_indices_ptr = buffered_indices0_ptr
     dst_buffered_indices_ptr = buffered_indices1_ptr
@@ -1037,11 +1037,11 @@ def _histogram_256_topk_v2(
                     output_pos = tl.atomic_add(
                         shared_output_count_ptr + zeros,
                         1,
-                        mask=bins > threshold_bin,
+                        mask=buffer_mask & (bins > threshold_bin),
                         sem="relaxed",
                         scope="cta",
                     )
-                    tl.store(row_output + output_pos, idx, mask=bins > threshold_bin)
+                    tl.store(row_output + output_pos, idx, mask=buffer_mask & (bins > threshold_bin))
                 tl.debug_barrier()
             else:
                 tl.debug_barrier()
@@ -1067,7 +1067,7 @@ def _histogram_256_topk_v2(
                         slot = tl.atomic_add(
                             shared_final_k_ptr + zeros,
                             -1,
-                            mask=bins == threshold_bin,
+                            mask=buffer_mask & (bins == threshold_bin),
                             sem="relaxed",
                             scope="cta",
                         )
@@ -1076,7 +1076,7 @@ def _histogram_256_topk_v2(
                         buffer_pos = tl.atomic_add(
                             dst_buffered_count_ptr + zeros,
                             1,
-                            mask=bins == threshold_bin,
+                            mask=buffer_mask & (bins == threshold_bin),
                             sem="relaxed",
                             scope="cta",
                         )
@@ -1098,6 +1098,7 @@ def _histogram_256_topk_v2(
         # if (pass_idx == 0) | (remaining_k > 0):
     # for pass_idx in tl.static_range(4):
     # 0.023552
+
 
 # histogram_2048_topk — production xiao implementation
 @triton.jit
