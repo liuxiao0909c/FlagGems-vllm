@@ -1055,39 +1055,41 @@ def _histogram_256_topk_v2(
                     x = tl.load(row_input + idx, mask=buffer_mask, other=float("-inf"))
                     fp32_bits = _convert_to_uint32_v2(x)
                     bins = (fp32_bits >> bit_offset) & 0xFF
+                    gt_mask = buffer_mask & (bins > threshold_bin)
                     output_pos = tl.atomic_add(
                         shared_output_count_ptr + zeros,
                         1,
-                        mask=bins > threshold_bin,
+                        mask=gt_mask,
                         sem="relaxed",
                         scope="cta",
                     )
-                    tl.store(row_output + output_pos, idx, mask=bins > threshold_bin)
+                    tl.store(row_output + output_pos, idx, mask=gt_mask)
+                    eq_mask = buffer_mask & (bins == threshold_bin)
                     if pass_idx == 3:
                         slot = tl.atomic_add(
                             shared_final_k_ptr + zeros,
                             -1,
-                            mask=buffer_mask & (bins == threshold_bin),
+                            mask=eq_mask,
                             sem="relaxed",
                             scope="cta",
                         )
-                        tl.store(row_output + TOPK - slot, idx, mask=(bins == threshold_bin) & (slot > 0))
+                        tl.store(row_output + TOPK - slot, idx, mask=eq_mask & (slot > 0))
                     else:
                         buffer_pos = tl.atomic_add(
                             dst_buffered_count_ptr + zeros,
                             1,
-                            mask=buffer_mask & (bins == threshold_bin),
+                            mask=eq_mask,
                             sem="relaxed",
                             scope="cta",
                         )
-                        buffer_mask2 = (bins == threshold_bin) & (buffer_pos < MAX_BUFFERED_ITEMS)
-                        tl.store(dst_buffered_indices_ptr + buffer_pos, idx, mask=buffer_mask2)
+                        buf_out_mask = eq_mask & (buffer_pos < MAX_BUFFERED_ITEMS)
+                        tl.store(dst_buffered_indices_ptr + buffer_pos, idx, mask=buf_out_mask)
                         next_bit_offset = bit_offset - 8
                         next_bin = (fp32_bits >> next_bit_offset) & 0xFF
                         tl.atomic_add(
                             shared_histogram0_ptr + next_bin,
                             1,
-                            mask=buffer_mask2,
+                            mask=buf_out_mask,
                             sem="relaxed",
                             scope="cta",
                         )
