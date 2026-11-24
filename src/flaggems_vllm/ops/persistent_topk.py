@@ -835,11 +835,11 @@ def _histogram_256_topk_v2(
     shared_final_k_ptr = shared_buffered_count1_ptr + 1
     buffered_indices0_ptr = shared_ordered_ptr + MEDIUM_HEADER_SIZE // 4
     buffered_indices1_ptr = buffered_indices0_ptr + MAX_BUFFERED_ITEMS
-    # return # 0.008
 
     remaining_k = tl.full((), TOPK, dtype=tl.uint32)
     tl.store(shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=tl.arange(0, BLOCK_SIZE) < (RADIX + 1))
     tl.debug_barrier()
+    #return # 0.003078 
 
     vec_cnt = seq_len // LOAD_SIZE
     norm_cnt = (seq_len - vec_cnt * LOAD_SIZE + (BLOCK_SIZE - 1)) // BLOCK_SIZE
@@ -866,6 +866,7 @@ def _histogram_256_topk_v2(
             scope="cta",
         )
     tl.debug_barrier()
+    #return # 0.006228
 
     _compute_cumulative_sum(shared_histogram0_ptr, shared_histogram1_ptr, RADIX, BLOCK_SIZE)
 
@@ -884,7 +885,7 @@ def _histogram_256_topk_v2(
     tl.store(shared_buffered_count0_ptr + zeros, 0, mask=match)
     tl.store(shared_output_count_ptr + zeros, 0, mask=match)
     tl.debug_barrier()
-    # return # 0.011968
+    #return # 0.006514
 
     threshold_bin = tl.load(shared_threshold_bin_ptr)
     remaining_k -= tl.load(shared_histogram0_ptr + threshold_bin + 1)
@@ -915,12 +916,12 @@ def _histogram_256_topk_v2(
             )
             tl.store(row_output + output_pos, tail_offs)
         tl.debug_barrier()
-        return
+        return  # early exit
 
     tl.debug_barrier()
     tl.store(shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=tl.arange(0, BLOCK_SIZE) < (RADIX + 1))
     tl.debug_barrier()
-    #return # 0.012352
+    # return # 0.006336
 
     for i in range(vec_cnt):
         vec_offs = LOAD_SIZE * i + tl.arange(0, LOAD_SIZE)
@@ -934,7 +935,7 @@ def _histogram_256_topk_v2(
             scope="cta",
         )
         tl.store(row_output + output_pos, vec_offs, mask=bins > threshold_bin)
-        # continue # 0.015584, 0.015584
+        # continue # 0.009611
         eq_mask = bins == threshold_bin
         buffer_pos = tl.atomic_add(
             shared_buffered_count0_ptr + zeros_vec,
@@ -957,6 +958,7 @@ def _histogram_256_topk_v2(
             sem="relaxed",
             scope="cta",
         )
+    #return # 0.012873
     for i in range(norm_cnt):
         tail_offs = LOAD_SIZE * vec_cnt + BLOCK_SIZE * i + tl.arange(0, BLOCK_SIZE)
         x = tl.load(row_input + tail_offs, mask=tail_offs < seq_len, other=float("-inf"))
@@ -992,114 +994,110 @@ def _histogram_256_topk_v2(
             scope="cta",
         )
     tl.debug_barrier()
-    #return  # 0.018688
+    #return  # 0.012848
 
     src_buffered_indices_ptr = buffered_indices0_ptr
     dst_buffered_indices_ptr = buffered_indices1_ptr
     src_buffered_count_ptr = shared_buffered_count0_ptr
     dst_buffered_count_ptr = shared_buffered_count1_ptr
     for pass_idx in tl.static_range(4):
-        if (pass_idx == 0) | (remaining_k > 0):
-            raw_buffered = tl.load(src_buffered_count_ptr)
-            num_buffered = tl.minimum(raw_buffered, MAX_BUFFERED_ITEMS)
+        raw_buffered = tl.load(src_buffered_count_ptr)
+        num_buffered = tl.minimum(raw_buffered, MAX_BUFFERED_ITEMS)
 
-            _compute_cumulative_sum(shared_histogram0_ptr, shared_histogram1_ptr, RADIX, BLOCK_SIZE)
+        _compute_cumulative_sum(shared_histogram0_ptr, shared_histogram1_ptr, RADIX, BLOCK_SIZE)
 
-            ss = tl.load(
-                shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE),
-                mask=tl.arange(0, BLOCK_SIZE) < RADIX,
-                other=0,
-            )
-            next_ss = tl.load(
-                shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE) + 1,
-                mask=tl.arange(0, BLOCK_SIZE) < RADIX,
-                other=0,
-            )
-            match = (ss > remaining_k) & (next_ss <= remaining_k)
-            tl.store(shared_threshold_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask=match)
-            tl.store(dst_buffered_count_ptr + zeros, 0, mask=match)
-            tl.store(shared_final_k_ptr + zeros, remaining_k - next_ss, mask=match)
+        ss = tl.load(
+            shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE),
+            mask=tl.arange(0, BLOCK_SIZE) < RADIX,
+            other=0,
+        )
+        next_ss = tl.load(
+            shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE) + 1,
+            mask=tl.arange(0, BLOCK_SIZE) < RADIX,
+            other=0,
+        )
+        match = (ss > remaining_k) & (next_ss <= remaining_k)
+        tl.store(shared_threshold_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask=match)
+        tl.store(dst_buffered_count_ptr + zeros, 0, mask=match)
+        tl.store(shared_final_k_ptr + zeros, remaining_k - next_ss, mask=match)
+        tl.debug_barrier()
+
+        threshold_bin = tl.load(shared_threshold_bin_ptr)
+        remaining_k -= tl.load(shared_histogram0_ptr + threshold_bin + 1)
+        bit_offset = 24 - pass_idx * 8
+        iter_cnt = (num_buffered + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+        if remaining_k == 0:
+            for j in range(iter_cnt):
+                buffer_offs = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                buffer_mask = buffer_offs < num_buffered
+                idx = tl.load(src_buffered_indices_ptr + buffer_offs, mask=buffer_mask, other=0)
+                x = tl.load(row_input + idx, mask=buffer_mask, other=float("-inf"))
+                fp32_bits = _convert_to_uint32_v2(x)
+                bins = (fp32_bits >> bit_offset) & 0xFF
+                output_pos = tl.atomic_add(
+                    shared_output_count_ptr + zeros,
+                    1,
+                    mask=buffer_mask & (bins > threshold_bin),
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(row_output + output_pos, idx, mask=buffer_mask & (bins > threshold_bin))
             tl.debug_barrier()
+            return  # early exit
 
-            threshold_bin = tl.load(shared_threshold_bin_ptr)
-            remaining_k -= tl.load(shared_histogram0_ptr + threshold_bin + 1)
-            bit_offset = 24 - pass_idx * 8
-            iter_cnt = (num_buffered + BLOCK_SIZE - 1) // BLOCK_SIZE
-
-            if remaining_k == 0:
-                for j in range(iter_cnt):
-                    buffer_offs = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-                    buffer_mask = buffer_offs < num_buffered
-                    idx = tl.load(src_buffered_indices_ptr + buffer_offs, mask=buffer_mask, other=0)
-                    x = tl.load(row_input + idx, mask=buffer_mask, other=float("-inf"))
-                    fp32_bits = _convert_to_uint32_v2(x)
-                    bins = (fp32_bits >> bit_offset) & 0xFF
-                    output_pos = tl.atomic_add(
-                        shared_output_count_ptr + zeros,
-                        1,
-                        mask=buffer_mask & (bins > threshold_bin),
-                        sem="relaxed",
-                        scope="cta",
-                    )
-                    tl.store(row_output + output_pos, idx, mask=buffer_mask & (bins > threshold_bin))
-                tl.debug_barrier()
+        tl.debug_barrier()
+        tl.store(shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=tl.arange(0, BLOCK_SIZE) < (RADIX + 1))
+        tl.debug_barrier()
+        for j in range(iter_cnt):
+            buffer_offs = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            buffer_mask = buffer_offs < num_buffered
+            idx = tl.load(src_buffered_indices_ptr + buffer_offs, mask=buffer_mask, other=0)
+            x = tl.load(row_input + idx, mask=buffer_mask, other=float("-inf"))
+            fp32_bits = _convert_to_uint32_v2(x)
+            bins = (fp32_bits >> bit_offset) & 0xFF
+            gt_mask = buffer_mask & (bins > threshold_bin)
+            output_pos = tl.atomic_add(
+                shared_output_count_ptr + zeros,
+                1,
+                mask=gt_mask,
+                sem="relaxed",
+                scope="cta",
+            )
+            tl.store(row_output + output_pos, idx, mask=gt_mask)
+            eq_mask = buffer_mask & (bins == threshold_bin)
+            if pass_idx == 3:
+                slot = tl.atomic_add(
+                    shared_final_k_ptr + zeros,
+                    -1,
+                    mask=eq_mask,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(row_output + TOPK - slot, idx, mask=eq_mask & (slot > 0))
             else:
-                tl.debug_barrier()
-                tl.store(shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=tl.arange(0, BLOCK_SIZE) < (RADIX + 1))
-                tl.debug_barrier()
-
-                for j in range(iter_cnt):
-                    buffer_offs = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-                    buffer_mask = buffer_offs < num_buffered
-                    idx = tl.load(src_buffered_indices_ptr + buffer_offs, mask=buffer_mask, other=0)
-                    x = tl.load(row_input + idx, mask=buffer_mask, other=float("-inf"))
-                    fp32_bits = _convert_to_uint32_v2(x)
-                    bins = (fp32_bits >> bit_offset) & 0xFF
-                    gt_mask = buffer_mask & (bins > threshold_bin)
-                    output_pos = tl.atomic_add(
-                        shared_output_count_ptr + zeros,
-                        1,
-                        mask=gt_mask,
-                        sem="relaxed",
-                        scope="cta",
-                    )
-                    tl.store(row_output + output_pos, idx, mask=gt_mask)
-                    eq_mask = buffer_mask & (bins == threshold_bin)
-                    if pass_idx == 3:
-                        slot = tl.atomic_add(
-                            shared_final_k_ptr + zeros,
-                            -1,
-                            mask=eq_mask,
-                            sem="relaxed",
-                            scope="cta",
-                        )
-                        tl.store(row_output + TOPK - slot, idx, mask=eq_mask & (slot > 0))
-                    else:
-                        buffer_pos = tl.atomic_add(
-                            dst_buffered_count_ptr + zeros,
-                            1,
-                            mask=eq_mask,
-                            sem="relaxed",
-                            scope="cta",
-                        )
-                        buf_out_mask = eq_mask & (buffer_pos < MAX_BUFFERED_ITEMS)
-                        tl.store(dst_buffered_indices_ptr + buffer_pos, idx, mask=buf_out_mask)
-                        next_bit_offset = bit_offset - 8
-                        next_bin = (fp32_bits >> next_bit_offset) & 0xFF
-                        tl.atomic_add(
-                            shared_histogram0_ptr + next_bin,
-                            1,
-                            mask=buf_out_mask,
-                            sem="relaxed",
-                            scope="cta",
-                        )
-                tl.debug_barrier()
-                src_buffered_indices_ptr, dst_buffered_indices_ptr = dst_buffered_indices_ptr, src_buffered_indices_ptr
-                src_buffered_count_ptr, dst_buffered_count_ptr = dst_buffered_count_ptr, src_buffered_count_ptr
-            # if remaining_k == 0:
-        # if (pass_idx == 0) | (remaining_k > 0):
-    # for pass_idx in tl.static_range(4):
-    # 0.023552
+                buffer_pos = tl.atomic_add(
+                    dst_buffered_count_ptr + zeros,
+                    1,
+                    mask=eq_mask,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                buf_out_mask = eq_mask & (buffer_pos < MAX_BUFFERED_ITEMS)
+                tl.store(dst_buffered_indices_ptr + buffer_pos, idx, mask=buf_out_mask)
+                next_bit_offset = bit_offset - 8
+                next_bin = (fp32_bits >> next_bit_offset) & 0xFF
+                tl.atomic_add(
+                    shared_histogram0_ptr + next_bin,
+                    1,
+                    mask=buf_out_mask,
+                    sem="relaxed",
+                    scope="cta",
+                )
+        tl.debug_barrier()
+        src_buffered_indices_ptr, dst_buffered_indices_ptr = dst_buffered_indices_ptr, src_buffered_indices_ptr
+        src_buffered_count_ptr, dst_buffered_count_ptr = dst_buffered_count_ptr, src_buffered_count_ptr
+    # 0.017350
 
 
 # histogram_2048_topk — production xiao implementation
