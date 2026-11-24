@@ -866,7 +866,6 @@ def _histogram_256_topk_v2(
             scope="cta",
         )
     tl.debug_barrier()
-    # return # 0.011008
 
     _compute_cumulative_sum(shared_histogram0_ptr, shared_histogram1_ptr, RADIX, BLOCK_SIZE)
 
@@ -921,7 +920,7 @@ def _histogram_256_topk_v2(
     tl.debug_barrier()
     tl.store(shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=tl.arange(0, BLOCK_SIZE) < (RADIX + 1))
     tl.debug_barrier()
-    # return # 0.012064
+    #return # 0.012352
 
     for i in range(vec_cnt):
         vec_offs = LOAD_SIZE * i + tl.arange(0, LOAD_SIZE)
@@ -934,8 +933,8 @@ def _histogram_256_topk_v2(
             sem="relaxed",
             scope="cta",
         )
-        tl.store(row_output + output_pos, vec_offs)
-        # continue # 0.015584
+        tl.store(row_output + output_pos, vec_offs, mask=bins > threshold_bin)
+        # continue # 0.015584, 0.015584
         eq_mask = bins == threshold_bin
         buffer_pos = tl.atomic_add(
             shared_buffered_count0_ptr + zeros_vec,
@@ -958,7 +957,6 @@ def _histogram_256_topk_v2(
             sem="relaxed",
             scope="cta",
         )
-    #return # 0.018816
     for i in range(norm_cnt):
         tail_offs = LOAD_SIZE * vec_cnt + BLOCK_SIZE * i + tl.arange(0, BLOCK_SIZE)
         x = tl.load(row_input + tail_offs, mask=tail_offs < seq_len, other=float("-inf"))
@@ -1400,7 +1398,7 @@ def _histogram_2048_topk(
 
 
 @triton.jit
-def persistent_topk_kernel(
+def triton_persistent_topk_kernel(
     logits_ptr,
     output_ptr,
     lengths_ptr,
@@ -1503,8 +1501,8 @@ def persistent_topk_kernel(
                             BLOCK_SIZE,
                         )
                     else:
-                        _histogram_256_topk(
-                        #_histogram_256_topk_v2(
+                        #_histogram_256_topk(
+                        _histogram_256_topk_v2(
                             row_in,
                             row_output,
                             seq_len,
@@ -3612,7 +3610,7 @@ def persistent_topk(
     )
 
     #import pdb; pdb.set_trace()
-    persistent_topk_kernel[(total_ctas,)](
+    triton_persistent_topk_kernel[(total_ctas,)](
         logits,
         output,
         seq_lens,
