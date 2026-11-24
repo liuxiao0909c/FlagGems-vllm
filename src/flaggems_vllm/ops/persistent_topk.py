@@ -979,6 +979,7 @@ def _histogram_256_topk_v2(
             sem="relaxed",
             scope="cta",
         )
+        # TODO: correctness issue if equal cnt > MAX_BUFFERED_ITEMS
         tl.store(
             buffered_indices0_ptr + buffer_pos,
             tail_offs,
@@ -1083,14 +1084,14 @@ def _histogram_256_topk_v2(
                     sem="relaxed",
                     scope="cta",
                 )
-                buf_out_mask = eq_mask & (buffer_pos < MAX_BUFFERED_ITEMS)
-                tl.store(dst_buffered_indices_ptr + buffer_pos, idx, mask=buf_out_mask)
+                # buffer_pos < MAX_BUFFERED_ITEMS
+                tl.store(dst_buffered_indices_ptr + buffer_pos, idx, mask=eq_mask)
                 next_bit_offset = bit_offset - 8
                 next_bin = (fp32_bits >> next_bit_offset) & 0xFF
                 tl.atomic_add(
                     shared_histogram0_ptr + next_bin,
                     1,
-                    mask=buf_out_mask,
+                    mask=eq_mask,
                     sem="relaxed",
                     scope="cta",
                 )
