@@ -806,23 +806,35 @@ def _compute_cumulative_sum(
         tl.debug_barrier()
 
 
+# ============================================================================
+# Medium path: exact 11-bit FP32 histogram + 3-pass FP32 refinement
+# For sequences 8K < seq_len <= 32K.
+# ============================================================================
+# Adapted from:
+# https://github.com/vllm-project/vllm/blob/v0.34.0/csrc/persistent_topk.cuh#L155
 @triton.jit
-def _histogram_256_topk_v2(
+def _histogram_medium_topk(
     row_input,
     row_output,
     seq_len,
     shared_ordered_ptr,
+    row_idx,
+    dump_ptr,
     TOPK: tl.constexpr,
     VEC_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # 1024
 ):
     RADIX: tl.constexpr = 256
     MEDIUM_HIST_BYTES: tl.constexpr = 2 * (RADIX + 128) * 4  # 3072
     MEDIUM_SCALARS_BYTES: tl.constexpr = 5 * 4  # 20
-    MEDIUM_HEADER_SIZE: tl.constexpr = (MEDIUM_HIST_BYTES + MEDIUM_SCALARS_BYTES + 127) // 128 * 128
+    MEDIUM_HEADER_SIZE: tl.constexpr = (MEDIUM_HIST_BYTES + MEDIUM_SCALARS_BYTES + 127) // 128 * 128  # 3200
     MAX_BUFFERED_ITEMS: tl.constexpr = 4096
     SMEM_MEDIUM: tl.constexpr = MEDIUM_HEADER_SIZE + 2 * MAX_BUFFERED_ITEMS * 4  # 35968
     LOAD_SIZE: tl.constexpr = BLOCK_SIZE * VEC_SIZE  # 4096
+    COARSE_BINS: tl.constexpr = 2048
+    BINS_PER_THREAD: tl.constexpr = COARSE_BINS // BLOCK_SIZE  # 2
+    NUM_WARPS: tl.constexpr = 32
+    WARP_SIZE: tl.constexpr = 32
     zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     zeros_vec = tl.zeros([LOAD_SIZE], dtype=tl.int32)
 
@@ -835,66 +847,94 @@ def _histogram_256_topk_v2(
     shared_final_k_ptr = shared_buffered_count1_ptr + 1
     buffered_indices0_ptr = shared_ordered_ptr + MEDIUM_HEADER_SIZE // 4
     buffered_indices1_ptr = buffered_indices0_ptr + MAX_BUFFERED_ITEMS
+    # reuse buffered_indices0_ptr as coarse_histogram 
+    coarse_histogram_ptr = buffered_indices0_ptr  # [COARSE_BINS + 1]
 
     remaining_k = tl.full((), TOPK, dtype=tl.uint32)
-    tl.store(shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=tl.arange(0, BLOCK_SIZE) < (RADIX + 1))
+    tl.store(coarse_histogram_ptr + tl.arange(0, COARSE_BINS), 0)
+    tl.store(coarse_histogram_ptr + COARSE_BINS + 1 + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
     tl.debug_barrier()
-    #return # 0.003078 
 
+    # Visit a row with vectorized loads and a scalar tail.
     vec_cnt = seq_len // LOAD_SIZE
-    norm_cnt = (seq_len - vec_cnt * LOAD_SIZE + (BLOCK_SIZE - 1)) // BLOCK_SIZE
+    tail_cnt = (seq_len - vec_cnt * LOAD_SIZE + (BLOCK_SIZE - 1)) // BLOCK_SIZE
     for i in range(vec_cnt):
         vec_offs = LOAD_SIZE * i + tl.arange(0, LOAD_SIZE)
         x = tl.load(row_input + vec_offs)
-        bins = _convert_to_uint8(x)
+        bins = _convert_to_uint32_v2(x) >> 21
         tl.atomic_add(
-            shared_histogram0_ptr + bins,
+            coarse_histogram_ptr + bins,
             1,
             mask=tl.full([LOAD_SIZE], 1, tl.int1),
             sem="relaxed",
             scope="cta",
         )
-    for i in range(norm_cnt):
+    for i in range(tail_cnt):
         tail_offs = LOAD_SIZE * vec_cnt + BLOCK_SIZE * i + tl.arange(0, BLOCK_SIZE)
         x = tl.load(row_input + tail_offs, mask=tail_offs < seq_len, other=float("-inf"))
-        bins = _convert_to_uint8(x)
+        bins = _convert_to_uint32_v2(x) >> 21
         tl.atomic_add(
-            shared_histogram0_ptr + bins,
+            coarse_histogram_ptr + bins,
             1,
             mask=tail_offs < seq_len,
             sem="relaxed",
             scope="cta",
         )
     tl.debug_barrier()
-    #return # 0.006228
 
-    _compute_cumulative_sum(shared_histogram0_ptr, shared_histogram1_ptr, RADIX, BLOCK_SIZE)
-
-    ss = tl.load(
-        shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE),
-        mask=tl.arange(0, BLOCK_SIZE) < RADIX,
-        other=0,
-    )
-    next_ss = tl.load(
-        shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE) + 1,
-        mask=tl.arange(0, BLOCK_SIZE) < RADIX,
-        other=0,
-    )
-    match = (ss > remaining_k) & (next_ss <= remaining_k)
-    tl.store(shared_threshold_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE), mask=match)
-    tl.store(shared_buffered_count0_ptr + zeros, 0, mask=match)
-    tl.store(shared_output_count_ptr + zeros, 0, mask=match)
+    # select_coarse_bin
+    count0 = tl.load(coarse_histogram_ptr + tl.arange(0, BLOCK_SIZE) * BINS_PER_THREAD)
+    count1 = tl.load(coarse_histogram_ptr + tl.arange(0, BLOCK_SIZE) * BINS_PER_THREAD + 1)
+    hist2048 = tl.load(coarse_histogram_ptr + tl.arange(0, 2048))
+    local_sum = count0 + count1
     tl.debug_barrier()
-    #return # 0.006514
+    warp_inc = tl.cumsum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1, reverse=False)
+    warp_total = tl.sum(local_sum.reshape(NUM_WARPS, WARP_SIZE), axis=-1)
+    total = tl.sum(warp_total, axis=-1)
+    warps = tl.arange(0, NUM_WARPS)
+    lanes = tl.arange(0, WARP_SIZE)
+    val = tl.where(lanes[None, :] < warps[:, None], warp_total[None, :], 0)
+    warps_before = tl.sum(val, axis=-1)
+    suffix0 = (total - warps_before[:, None] - warp_inc).reshape(BLOCK_SIZE) + local_sum
+    tl.store(coarse_histogram_ptr + tl.arange(0, BLOCK_SIZE) * BINS_PER_THREAD, suffix0)
+    suffix1 = suffix0 - count0
+    #if row_idx == 0:
+    #    tl.store(dump_ptr + tl.arange(0, 2048), hist2048)
+    #    tl.store(dump_ptr + 4096 + tl.arange(0, BLOCK_SIZE), local_sum)
+    #    tl.store(dump_ptr + 4096 * 2 + tl.arange(0, BLOCK_SIZE), warp_inc.reshape(BLOCK_SIZE))
+    #    tl.store(dump_ptr + 4096 * 3 + tl.arange(0, NUM_WARPS), warp_total)
+    #    tl.store(dump_ptr + 4096 * 4, total)
+    #    tl.store(dump_ptr + 4096 * 5 + tl.arange(0, NUM_WARPS), warps_before)
+    #    tl.store(dump_ptr + 4096 * 6 + tl.arange(0, BLOCK_SIZE), suffix0)
+    #    tl.store(dump_ptr + 4096 * 7 + tl.arange(0, BLOCK_SIZE), suffix1)
+    tl.store(coarse_histogram_ptr + tl.arange(0, BLOCK_SIZE) * BINS_PER_THREAD + 1, suffix1)
+    tl.debug_barrier()
+    mask = (suffix0 > TOPK) & (suffix1 <= TOPK)
+    tl.store(shared_threshold_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * BINS_PER_THREAD, mask)
+    suffix2 = tl.load(coarse_histogram_ptr + tl.arange(0, BLOCK_SIZE) * BINS_PER_THREAD + 2)
+    #if row_idx == 0:
+    #    tl.store(dump_ptr + 4096 * 8 + tl.arange(0, BLOCK_SIZE), suffix2)
+    mask = (suffix1 > TOPK) & (suffix2 <= TOPK)
+    tl.store(shared_threshold_bin_ptr + zeros, tl.arange(0, BLOCK_SIZE) * BINS_PER_THREAD + 1, mask)
+    tl.debug_barrier()
 
     threshold_bin = tl.load(shared_threshold_bin_ptr)
-    remaining_k -= tl.load(shared_histogram0_ptr + threshold_bin + 1)
+    count_above = tl.load(coarse_histogram_ptr + threshold_bin + 1)
+    threshold_bin_count = tl.load(coarse_histogram_ptr + threshold_bin) - count_above
+    tl.store(shared_buffered_count0_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
+    tl.store(shared_output_count_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
+    tl.debug_barrier()
+    #if (row_idx == 0):
+    #    tl.store(dump_ptr + 4096 * 9, threshold_bin)
+    #    tl.store(dump_ptr + 4096 * 9 + 1, count_above)
+    #    tl.store(dump_ptr + 4096 * 9 + 2, threshold_bin_count)
 
+    remaining_k -= count_above
     if remaining_k == 0:
         for i in range(vec_cnt):
             vec_offs = LOAD_SIZE * i + tl.arange(0, LOAD_SIZE)
             x = tl.load(row_input + vec_offs)
-            bins = _convert_to_uint8(x)
+            bins = _convert_to_uint32_v2(x) >> 21
             output_pos = tl.atomic_add(
                 shared_output_count_ptr + zeros_vec,
                 1,
@@ -902,11 +942,11 @@ def _histogram_256_topk_v2(
                 sem="relaxed",
                 scope="cta",
             )
-            tl.store(row_output + output_pos, vec_offs)
-        for i in range(norm_cnt):
+            tl.store(row_output + output_pos, vec_offs, mask=bins > threshold_bin)
+        for i in range(tail_cnt):
             tail_offs = LOAD_SIZE * vec_cnt + BLOCK_SIZE * i + tl.arange(0, BLOCK_SIZE)
             x = tl.load(row_input + tail_offs, mask=tail_offs < seq_len, other=float("-inf"))
-            bins = _convert_to_uint8(x)
+            bins = _convert_to_uint32_v2(x) >> 21
             output_pos = tl.atomic_add(
                 shared_output_count_ptr + zeros,
                 1,
@@ -914,28 +954,27 @@ def _histogram_256_topk_v2(
                 sem="relaxed",
                 scope="cta",
             )
-            tl.store(row_output + output_pos, tail_offs)
+            tl.store(row_output + output_pos, tail_offs, mask=(tail_offs < seq_len) & (bins > threshold_bin))
         tl.debug_barrier()
         return  # early exit
 
-    tl.debug_barrier()
+    # TODO: handle overflow if threshold_bin_count > MAX_BUFFERED_ITEMS
     tl.store(shared_histogram0_ptr + tl.arange(0, BLOCK_SIZE), 0, mask=tl.arange(0, BLOCK_SIZE) < (RADIX + 1))
     tl.debug_barrier()
-    # return # 0.006336
-
     for i in range(vec_cnt):
         vec_offs = LOAD_SIZE * i + tl.arange(0, LOAD_SIZE)
         x = tl.load(row_input + vec_offs)
-        bins = _convert_to_uint8(x)
+        ordered = _convert_to_uint32_v2(x)
+        bins = ordered >> 21
+        gt_mask = bins > threshold_bin
         output_pos = tl.atomic_add(
             shared_output_count_ptr + zeros_vec,
             1,
-            mask=bins > threshold_bin,
+            mask=gt_mask,
             sem="relaxed",
             scope="cta",
         )
-        tl.store(row_output + output_pos, vec_offs, mask=bins > threshold_bin)
-        # continue # 0.009611
+        tl.store(row_output + output_pos, vec_offs, mask=gt_mask)
         eq_mask = bins == threshold_bin
         buffer_pos = tl.atomic_add(
             shared_buffered_count0_ptr + zeros_vec,
@@ -949,8 +988,7 @@ def _histogram_256_topk_v2(
             vec_offs,
             mask=eq_mask & (buffer_pos < MAX_BUFFERED_ITEMS),
         )
-        fp32_bits = _convert_to_uint32_v2(x)
-        next_bin = (fp32_bits >> 24) & 0xFF
+        next_bin = (ordered >> 16) & 0xFF
         tl.atomic_add(
             shared_histogram0_ptr + next_bin,
             1,
@@ -958,20 +996,21 @@ def _histogram_256_topk_v2(
             sem="relaxed",
             scope="cta",
         )
-    #return # 0.012873
-    for i in range(norm_cnt):
+    for i in range(tail_cnt):
         tail_offs = LOAD_SIZE * vec_cnt + BLOCK_SIZE * i + tl.arange(0, BLOCK_SIZE)
         x = tl.load(row_input + tail_offs, mask=tail_offs < seq_len, other=float("-inf"))
-        bins = _convert_to_uint8(x)
+        ordered = _convert_to_uint32_v2(x)
+        bins = ordered >> 21
+        gt_mask = (tail_offs < seq_len) & (bins > threshold_bin)
         output_pos = tl.atomic_add(
             shared_output_count_ptr + zeros,
             1,
-            mask=bins > threshold_bin,
+            mask=gt_mask,
             sem="relaxed",
             scope="cta",
         )
-        tl.store(row_output + output_pos, tail_offs, mask=bins > threshold_bin)
-        eq_mask = bins == threshold_bin
+        tl.store(row_output + output_pos, tail_offs, mask=gt_mask)
+        eq_mask = (tail_offs < seq_len) & (bins == threshold_bin)
         buffer_pos = tl.atomic_add(
             shared_buffered_count0_ptr + zeros,
             1,
@@ -979,14 +1018,12 @@ def _histogram_256_topk_v2(
             sem="relaxed",
             scope="cta",
         )
-        # TODO: correctness issue if equal cnt > MAX_BUFFERED_ITEMS
         tl.store(
             buffered_indices0_ptr + buffer_pos,
             tail_offs,
             mask=eq_mask & (buffer_pos < MAX_BUFFERED_ITEMS),
         )
-        fp32_bits = _convert_to_uint32_v2(x)
-        next_bin = (fp32_bits >> 24) & 0xFF
+        next_bin = (ordered >> 16) & 0xFF
         tl.atomic_add(
             shared_histogram0_ptr + next_bin,
             1,
@@ -995,13 +1032,12 @@ def _histogram_256_topk_v2(
             scope="cta",
         )
     tl.debug_barrier()
-    #return  # 0.012848
 
     src_buffered_indices_ptr = buffered_indices0_ptr
     dst_buffered_indices_ptr = buffered_indices1_ptr
     src_buffered_count_ptr = shared_buffered_count0_ptr
     dst_buffered_count_ptr = shared_buffered_count1_ptr
-    for pass_idx in tl.static_range(4):
+    for pass_idx in tl.static_range(3):
         raw_buffered = tl.load(src_buffered_count_ptr)
         num_buffered = tl.minimum(raw_buffered, MAX_BUFFERED_ITEMS)
 
@@ -1025,7 +1061,7 @@ def _histogram_256_topk_v2(
 
         threshold_bin = tl.load(shared_threshold_bin_ptr)
         remaining_k -= tl.load(shared_histogram0_ptr + threshold_bin + 1)
-        bit_offset = 24 - pass_idx * 8
+        bit_offset = 16 - pass_idx * 8
         iter_cnt = (num_buffered + BLOCK_SIZE - 1) // BLOCK_SIZE
 
         if remaining_k == 0:
@@ -1098,7 +1134,6 @@ def _histogram_256_topk_v2(
         tl.debug_barrier()
         src_buffered_indices_ptr, dst_buffered_indices_ptr = dst_buffered_indices_ptr, src_buffered_indices_ptr
         src_buffered_count_ptr, dst_buffered_count_ptr = dst_buffered_count_ptr, src_buffered_count_ptr
-    # 0.017350
 
 
 # histogram_2048_topk — production xiao implementation
@@ -1413,6 +1448,7 @@ def triton_persistent_topk_kernel(
     num_groups,
     g_histogram_ptr,
     g_state_ptr,
+    dump_buf,
     VEC_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -1504,11 +1540,13 @@ def triton_persistent_topk_kernel(
                         )
                     else:
                         #_histogram_256_topk(
-                        _histogram_256_topk_v2(
+                        _histogram_medium_topk(
                             row_in,
                             row_output,
                             seq_len,
                             shared_ordered_ptr,
+                            row_idx,
+                            dump_buf,
                             TOPK,
                             VEC_SIZE,
                             BLOCK_SIZE,
@@ -3126,6 +3164,7 @@ def _histogram_4096_topk_kernel(
         nv_mma_shared_layout=False,
     )
     s_warp_sum_ptr = tle.gpu.local_ptr(s_warp_sum, (0,))
+    # shared by histogram and idx of tie
     s_buffer = tle.gpu.alloc(
         [BUFFER_SIZE],
         dtype=tl.uint32,
@@ -3144,7 +3183,7 @@ def _histogram_4096_topk_kernel(
     )
     s_tie_score_ptr = tle.gpu.local_ptr(s_tie_score, (0,))
     s_vec = tle.gpu.alloc(
-        [ELEMS_PER_THREAD * BLOCK_SIZE],
+        [ELEMS_PER_THREAD * BLOCK_SIZE],  # 32768
         dtype=tl.float32,
         layout=None,
         scope=tle.gpu.smem,
@@ -3164,7 +3203,7 @@ def _histogram_4096_topk_kernel(
     vec_offs = tl.arange(0, LOAD_SIZE)  # LOAD_SIZE = 1024 * 4
     chunk_cnt = (length + LOAD_SIZE - 1) // LOAD_SIZE
     vec_cnt = length // LOAD_SIZE
-    norm_cnt = (length - vec_cnt * LOAD_SIZE + (BLOCK_SIZE - 1)) // BLOCK_SIZE
+    tail_cnt = (length - vec_cnt * LOAD_SIZE + (BLOCK_SIZE - 1)) // BLOCK_SIZE
     #vecs = tl.full([8, LOAD_SIZE], float("-inf"), dtype=tl.float32)  use tle.insert_tile if out of smem
     for i in range(vec_cnt):
         cur_offs = vec_offs + LOAD_SIZE * i
@@ -3173,7 +3212,7 @@ def _histogram_4096_topk_kernel(
         tl.store(s_vec_ptr + cur_offs, vecs_i)
         #vecs = tle.insert_tile(vecs, vecs_i[None, :], index=[i, 0])
         _histogram_vecs(vecs_i, s_histogram_ptr, tl.full([LOAD_SIZE], True, dtype=tl.int1), HIST_BITS)
-    for j in range(norm_cnt):
+    for j in range(tail_cnt):
         tail_offs = LOAD_SIZE * vec_cnt + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * j
         x = tl.load(row_ptr + tail_offs, mask=tail_offs < length, other=float("-inf"))
         tl.store(s_vec_ptr + tail_offs, x)
@@ -3238,6 +3277,7 @@ def _histogram_4096_topk_kernel(
     num_above = tl.load(s_above_count_ptr)
     num_equal = tl.load(s_equal_count_ptr)
     need_tie = (num_equal + num_above > TOPK)
+    # TODO: handle overflow if (need_tie & (num_equal > TOPK))
     zeros_vec = tl.zeros([LOAD_SIZE], dtype=tl.int32)
     for i in range(vec_cnt):
         cur_offs = vec_offs + LOAD_SIZE *  i
@@ -3258,7 +3298,7 @@ def _histogram_4096_topk_kernel(
             HIST_BITS,
             TOPK,
         )
-    for j in range(norm_cnt):
+    for j in range(tail_cnt):
         tail_offs = LOAD_SIZE * vec_cnt + tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * j
         x = tl.load(s_vec_ptr + tail_offs)
         _process_vecs(
@@ -3611,6 +3651,7 @@ def persistent_topk(
         .view(num_groups, 4)
     )
 
+    dump_buf = torch.zeros([60, 4096], dtype=torch.int32, device=logits.device)
     #import pdb; pdb.set_trace()
     triton_persistent_topk_kernel[(total_ctas,)](
         logits,
@@ -3625,7 +3666,9 @@ def persistent_topk(
         num_groups,
         g_histogram,
         g_state,
+        dump_buf,
         VEC_SIZE=vec_size,
         BLOCK_SIZE=THREADS_PER_BLOCK,
         num_warps=THREADS_PER_BLOCK // 32,
     )
+    #import pdb; pdb.set_trace()
