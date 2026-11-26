@@ -780,8 +780,9 @@ def _rescan_route_histogram(
     idx,
     mask,
     zeros,
-    prefix_mask,
     shift_bits,
+    digit_mask,
+    prefix_mask,
     prefix,
     final_round,
     histogram_ptr,
@@ -794,7 +795,7 @@ def _rescan_route_histogram(
     ordered = _convert_to_uint32_v2(x)
     ordered_prefix = ordered & prefix_mask
     tl.atomic_add(
-        histogram_ptr + ((ordered >> shift_bits) & prefix_mask).to(tl.int32, bitcast=True),
+        histogram_ptr + ((ordered >> shift_bits) & digit_mask).to(tl.int32),
         1,
         mask=mask & (ordered_prefix == prefix),
         sem="relaxed",
@@ -925,8 +926,9 @@ def _exact_topk_rescan(
                 vec_offs,
                 tl.full([LOAD_SIZE], 1, tl.int1),
                 zeros_vec,
-                prefix_mask,
                 shift_bits,
+                digit_mask,
+                prefix_mask,
                 prefix,
                 final_round,
                 histogram_ptr,
@@ -944,8 +946,9 @@ def _exact_topk_rescan(
                 tail_offs,
                 tail_offs < seq_len,
                 zeros,
-                prefix_mask,
                 shift_bits,
+                digit_mask,
+                prefix_mask,
                 prefix,
                 final_round,
                 histogram_ptr,
@@ -967,8 +970,9 @@ def _exact_topk_rescan(
         total = tl.sum(warp_total, axis=-1)
         warps = tl.arange(0, NUM_WARPS)
         lanes = tl.arange(0, WARP_SIZE)
-        val = tl.where(lanes[None, :] < warps[:, None], warp_total[None, :], 0)
+        val = tl.where(lanes[None, :] > warps[:, None], warp_total[None, :], 0)
         warps_before = tl.sum(val, axis=-1)
+        # exclusive suffix sum
         count_above = (warps_before[:, None] + warp_total[:, None] - warp_inc).reshape(BLOCK_SIZE)
         mask1 = (count_above < remaining) & (count_above + count1 >= remaining)
         bins1 = tl.arange(0, BLOCK_SIZE) * BINS_PER_THREAD + 1
@@ -984,88 +988,54 @@ def _exact_topk_rescan(
         if FINAL_CANDIDATE_CAPACITY > 0:
             tl.store(pivot_count_ptr + zeros, count0, mask=mask0)
         tl.debug_barrier()
-    
-        pivot = tl.load(pivot_count_ptr)
-        if FINAL_CANDIDATE_CAPACITY > 0:
-            tl.store(output_counter_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
-        tl.store(histogram_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
-        tl.debug_barrier()
 
-        equal_count = tl.load(remaining_ptr)
-        equal_base = TOPK - equal_count
-        if FINAL_CANDIDATE_CAPACITY > 0:
-            candidate_count = tl.load(candidate_count_ptr)
-            if candidate_count <= FINAL_CANDIDATE_CAPACITY:
-                iter_cnt = (candidate_count + BLOCK_SIZE - 1) // BLOCK_SIZE
-                for i in range(iter_cnt):
-                    candiate_offs = BLOCK_SIZE * i + tl.arange(0, BLOCK_SIZE)
-                    idx = tl.load(
-                        final_candidates_ptr + candiate_offs,
-                        mask=candiate_offs < candidate_count,
-                        other=HIST2048_THRESHOLD,
-                    )
-                    x = tl.load(row_input + idx, mask=candiate_offs < candidate_count, other=float("-inf"))
-                    ordered = _convert_to_uint32_v2(x)
-                    _rescan_route_collect(
-                        ordered,
-                        idx,
-                        candiate_offs < candidate_count,
-                        zeros,
-                        pivot,
-                        row_input,
-                        row_output,
-                        output_counter_ptr,
-                        equal_base,
-                        equal_count,
-                        histogram_ptr,
-                    )
-            elif candidate_count == tl.load(pivot_count_ptr):
-                iter_cnt = (equal_count + BLOCK_SIZE - 1) // BLOCK_SIZE
-                for i in range(iter_cnt):
-                    candiate_offs = BLOCK_SIZE * i + tl.arange(0, BLOCK_SIZE)
-                    idx = tl.load(
-                        final_candidates_ptr + candiate_offs,
-                        mask=candiate_offs < equal_count,
-                        other=HIST2048_THRESHOLD,
-                    )
-                    tl.store(row_output + equal_base + candiate_offs, idx, mask=candiate_offs < equal_count) 
-            else:
-                FINAL_PREFIX_MASK: tl.constexpr = 0xfffffc00
-                for i in range(vec_cnt):
-                    vec_offs = LOAD_SIZE * i + tl.arange(0, LOAD_SIZE)
-                    x = tl.load(row_input + vec_offs)
-                    ordered = _convert_to_uint32_v2(x)
-                    _rescan_route_collect(
-                        ordered,
-                        vec_offs,
-                        (ordered & FINAL_PREFIX_MASK) == (pivot & FINAL_PREFIX_MASK),
-                        zeros_vec,
-                        pivot,
-                        row_input,
-                        row_output,
-                        output_counter_ptr,
-                        equal_base,
-                        equal_count,
-                        histogram_ptr,
-                    )
-                for i in range(tail_cnt):
-                    tail_offs = LOAD_SIZE * vec_cnt + BLOCK_SIZE * i  + tl.arange(0, BLOCK_SIZE)
-                    x = tl.load(row_input + tail_offs, mask=tail_offs < seq_len, other=float("-inf"))
-                    ordered = _convert_to_uint32_v2(x)
-                    _rescan_route_collect(
-                        ordered,
-                        tail_offs,
-                        (tail_offs < seq_len) & ((ordered & FINAL_PREFIX_MASK) == (pivot & FINAL_PREFIX_MASK)),
-                        zeros,
-                        pivot,
-                        row_input,
-                        row_output,
-                        output_counter_ptr,
-                        equal_base,
-                        equal_count,
-                        histogram_ptr,
-                    )
+    pivot = tl.load(prefix_ptr)
+    if FINAL_CANDIDATE_CAPACITY == 0:
+        tl.store(output_counter_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
+    tl.store(histogram_ptr + zeros, 0, mask=tl.arange(0, BLOCK_SIZE) == 0)
+    tl.debug_barrier()
+
+    equal_count = tl.load(remaining_ptr)
+    equal_base = TOPK - equal_count
+
+    if FINAL_CANDIDATE_CAPACITY > 0:
+        candidate_count = tl.load(candidate_count_ptr)
+        if candidate_count <= FINAL_CANDIDATE_CAPACITY:
+            iter_cnt = (candidate_count + BLOCK_SIZE - 1) // BLOCK_SIZE
+            for i in range(iter_cnt):
+                candiate_offs = BLOCK_SIZE * i + tl.arange(0, BLOCK_SIZE)
+                idx = tl.load(
+                    final_candidates_ptr + candiate_offs,
+                    mask=candiate_offs < candidate_count,
+                    other=HIST2048_THRESHOLD,
+                )
+                x = tl.load(row_input + idx, mask=candiate_offs < candidate_count, other=float("-inf"))
+                ordered = _convert_to_uint32_v2(x)
+                _rescan_route_collect(
+                    ordered,
+                    idx,
+                    candiate_offs < candidate_count,
+                    zeros,
+                    pivot,
+                    row_input,
+                    row_output,
+                    output_counter_ptr,
+                    equal_base,
+                    equal_count,
+                    histogram_ptr,
+                )
+        elif candidate_count == tl.load(pivot_count_ptr):
+            iter_cnt = (equal_count + BLOCK_SIZE - 1) // BLOCK_SIZE
+            for i in range(iter_cnt):
+                candiate_offs = BLOCK_SIZE * i + tl.arange(0, BLOCK_SIZE)
+                idx = tl.load(
+                    final_candidates_ptr + candiate_offs,
+                    mask=candiate_offs < equal_count,
+                    other=HIST2048_THRESHOLD,
+                )
+                tl.store(row_output + equal_base + candiate_offs, idx, mask=candiate_offs < equal_count) 
         else:
+            FINAL_PREFIX_MASK: tl.constexpr = 0xfffffc00
             for i in range(vec_cnt):
                 vec_offs = LOAD_SIZE * i + tl.arange(0, LOAD_SIZE)
                 x = tl.load(row_input + vec_offs)
@@ -1073,7 +1043,7 @@ def _exact_topk_rescan(
                 _rescan_route_collect(
                     ordered,
                     vec_offs,
-                    tl.full([LOAD_SIZE], 1, tl.int1),
+                    (ordered & FINAL_PREFIX_MASK) == (pivot & FINAL_PREFIX_MASK),
                     zeros_vec,
                     pivot,
                     row_input,
@@ -1090,7 +1060,7 @@ def _exact_topk_rescan(
                 _rescan_route_collect(
                     ordered,
                     tail_offs,
-                    tail_offs < seq_len,
+                    (tail_offs < seq_len) & ((ordered & FINAL_PREFIX_MASK) == (pivot & FINAL_PREFIX_MASK)),
                     zeros,
                     pivot,
                     row_input,
@@ -1100,6 +1070,41 @@ def _exact_topk_rescan(
                     equal_count,
                     histogram_ptr,
                 )
+    else:
+        for i in range(vec_cnt):
+            vec_offs = LOAD_SIZE * i + tl.arange(0, LOAD_SIZE)
+            x = tl.load(row_input + vec_offs)
+            ordered = _convert_to_uint32_v2(x)
+            _rescan_route_collect(
+                ordered,
+                vec_offs,
+                tl.full([LOAD_SIZE], 1, tl.int1),
+                zeros_vec,
+                pivot,
+                row_input,
+                row_output,
+                output_counter_ptr,
+                equal_base,
+                equal_count,
+                histogram_ptr,
+            )
+        for i in range(tail_cnt):
+            tail_offs = LOAD_SIZE * vec_cnt + BLOCK_SIZE * i  + tl.arange(0, BLOCK_SIZE)
+            x = tl.load(row_input + tail_offs, mask=tail_offs < seq_len, other=float("-inf"))
+            ordered = _convert_to_uint32_v2(x)
+            _rescan_route_collect(
+                ordered,
+                tail_offs,
+                tail_offs < seq_len,
+                zeros,
+                pivot,
+                row_input,
+                row_output,
+                output_counter_ptr,
+                equal_base,
+                equal_count,
+                histogram_ptr,
+            )
     return
 
 
@@ -3962,7 +3967,6 @@ def persistent_topk(
         .view(num_groups, 4)
     )
 
-    #import pdb; pdb.set_trace()
     triton_persistent_topk_kernel[(total_ctas,)](
         logits,
         output,
@@ -3980,4 +3984,3 @@ def persistent_topk(
         BLOCK_SIZE=THREADS_PER_BLOCK,
         num_warps=THREADS_PER_BLOCK // 32,
     )
-    #import pdb; pdb.set_trace()
